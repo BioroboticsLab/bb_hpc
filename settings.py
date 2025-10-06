@@ -63,7 +63,7 @@ track_settings = {
     "maxjobs": 100,
     "gpu": False,
 }
-
+ 
 ## rpi
 rpi_detect_settings = {
     "jobname": 'rpi',
