@@ -89,6 +89,7 @@ def main():
     job.exports = f"{base_exports},{extra}" if base_exports else extra
 
     # ---------- write & submit ----------
+    job.clear_input_files = lambda: None # this is needed so that createjobs() does not delete existing input files
     job.createjobs()
     job.write_batch_file()
     job.run_jobs()

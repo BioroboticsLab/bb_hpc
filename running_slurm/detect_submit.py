@@ -103,6 +103,7 @@ def main():
     job.n_gpus = ngpus  # write_batch_file() will emit '#SBATCH --gres=gpu:<n>'
 
     # submit
+    job.clear_input_files = lambda: None # this is needed so that createjobs() does not delete existing input files
     job.createjobs()
     job.write_batch_file()
     job.run_jobs()

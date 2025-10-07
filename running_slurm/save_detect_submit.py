@@ -71,7 +71,7 @@ def main():
     job.custom_preamble      = s_sl.get("custom_preamble", "")
 
     # Create inputs + batch file
-    job.createjobs()
+    job.clear_input_files = lambda: None # this is needed so that createjobs() does not delete existing input files    job.createjobs()
     job.write_batch_file()
 
     if args.dry_run:

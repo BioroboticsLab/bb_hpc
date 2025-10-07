@@ -25,7 +25,7 @@ python -m bb_hpc.running_slurm.drip_submit \
 from __future__ import annotations
 import sys, os, json, time, subprocess, shlex
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import argparse
 
 # Map job types to their submit modules
@@ -47,7 +47,7 @@ SUBMIT_LIMIT_PATTERNS = (
 )
 
 def parse_args():
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     today = now.strftime("%Y%m%d")
     yesterday = (now - timedelta(days=1)).strftime("%Y%m%d")
 
