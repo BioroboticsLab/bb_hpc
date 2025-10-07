@@ -21,6 +21,8 @@ def parse_args():
     p.add_argument("--containers-per-gpu", type=int,
                    default=int(settings.docker.get("containers_per_gpu", 1)),
                    help="How many containers to run per GPU (default 1).")
+    p.add_argument("--use-fileinfo", action="store_true",
+                   help="Use RESULTDIR/bbb_fileinfo/bbb_info_*.parquet to skip videos whose .bbb already exists.")
     return p.parse_args()
 
 
@@ -124,6 +126,9 @@ def main():
     args = parse_args()
     s = settings.detect_settings
 
+    # RESULTDIR (where bbb_fileinfo lives) — prefer explicit setting, else fall back near jobdir_local
+    result_local = Path(getattr(settings, "resultdir_local", Path(settings.jobdir_local).parent))
+
     # Local → HPC roots
     video_local = Path(settings.videodir_local)
     video_hpc   = Path(settings.videodir_hpc)
@@ -135,13 +140,15 @@ def main():
 
     # Build chunks from LOCAL view
     chunks = list(generate_jobs_detect(
-        video_root_dir   = str(video_local),
-        repo_output_path = str(Path(settings.pipeline_root_local)),
-        slurmdir         = None,
-        chunk_size       = s.get("chunk_size", 4),
-        maxjobs          = s.get("maxjobs", None),
-        datestring       = args.dates,
-        verbose          = False,
+        video_root_dir    = str(video_local),
+        repo_output_path  = str(Path(settings.pipeline_root_local)),
+        RESULTDIR         = str(result_local),
+        slurmdir          = None,
+        chunk_size        = s.get("chunk_size", 4),
+        maxjobs           = s.get("maxjobs", None),
+        datestring        = args.dates,
+        verbose           = False,
+        use_fileinfo      = bool(args.use_fileinfo),
     ))
     if not chunks:
         print("Nothing to do.")

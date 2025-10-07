@@ -35,7 +35,7 @@ def main():
         PIPELINE_ROOT  = str(settings.pipeline_root_hpc),
         TEMP_DIR       = str(s_trk.get("temp_path", "/tmp/bb_tracking_tmp")),
         datestring     = args.dates,
-        chunk_size     = int(s_trk.get("chunk_size", 50)),
+        chunk_size     = int(s_trk.get("chunk_size", 1)),
         maxjobs        = s_trk.get("maxjobs", None),
         interval_hours = int(s_trk.get("interval_hours", 1)),
     ))

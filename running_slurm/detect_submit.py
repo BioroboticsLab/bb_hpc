@@ -72,7 +72,6 @@ def main():
     slurmdir = None  # keep your current behavior (no queue-scan)
 
     # Map function over generated work items
-    # generate_jobs_detect yields dicts like {"video_paths": [...]}
     job.map(
         job_for_process_videos,
         generate_jobs_detect(
