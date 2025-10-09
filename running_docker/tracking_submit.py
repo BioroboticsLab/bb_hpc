@@ -96,8 +96,11 @@ def _resolve_gpus_arg(cfg_value: str | None) -> str | None:
     return "all"
 
 
-def docker_run_cmd(image, binds, env, runner_path, filelist_container, gpus_arg: str | None):
+def docker_run_cmd(image, binds, env, runner_path, filelist_container, gpus_arg: str | None, runtime: str | None):
     parts = ["docker", "run", "--rm"]
+    # Allow forcing a specific container runtime (e.g., nvidia)
+    if runtime:
+        parts += ["--runtime", str(runtime)]
     if gpus_arg:
         parts += ["--gpus", gpus_arg]
     for k, v in env.items():
@@ -138,6 +141,7 @@ def main():
 
     # Docker knobs (define BEFORE we need 'binds')
     dkr       = settings.docker
+    runtime   = dkr.get("runtime")
     image     = dkr["image"]
     env       = dict(dkr.get("env", {}))
     binds     = dkr.get("binds", [])
@@ -205,7 +209,7 @@ def main():
             per_worker_gpus_arg = None
             if gpu_enabled:
                 per_worker_gpus_arg = f"device={gpu_id}" if gpu_id is not None else None
-            cmd = docker_run_cmd(image, binds, env, runner, fl_ctr, per_worker_gpus_arg)
+            cmd = docker_run_cmd(image, binds, env, runner, fl_ctr, per_worker_gpus_arg, runtime)
             print(f"Starting: {shlex.join(cmd)}", flush=True)
             rc = subprocess.call(cmd)
             print(f"Finished {f.name} -> rc={rc}", flush=True)

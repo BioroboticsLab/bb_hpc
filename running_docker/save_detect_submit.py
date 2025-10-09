@@ -52,8 +52,10 @@ def host_to_container_path(path: Path, bind_pairs) -> str:
             continue
     return str(p)
 
-def docker_run_cmd(image, binds, env, runner_path, filelist_container):
+def docker_run_cmd(image, binds, env, runner_path, filelist_container, runtime=None):
     parts = ["docker", "run", "--rm"]
+    if runtime:
+        parts += ["--runtime", str(runtime)]
     for k, v in env.items():
         parts += ["-e", f"{k}={v}"]
     for host_p, cont_p in binds:
@@ -103,6 +105,7 @@ def main():
     image = dkr["image"]
     env   = dkr.get("env", {})
     binds = dkr.get("binds", [])
+    runtime = dkr.get("runtime")
     # Prefer specific save-detect runner path, else general runner_path, else our default:
     runner_path = dkr.get(
         "runner_path_save_detect",
@@ -148,14 +151,15 @@ def main():
             except IndexError:
                 return
             fl_ctr = host_to_container_path(f, binds)
-            cmd = docker_run_cmd(image, binds, env, runner_path, fl_ctr)
+            cmd = docker_run_cmd(image, binds, env, runner_path, fl_ctr, runtime)
             print(f"Starting: {shlex.join(cmd)}", flush=True)
             rc = subprocess.call(cmd)
             print(f"Finished {f.name} -> rc={rc}", flush=True)
 
     # cap workers to number of shards
     workers = max(1, min(args.workers, len(shard_paths)))
-    print(f"Running {len(shard_paths)} shards with {workers} parallel container(s).", flush=True)
+    rt_msg = f" (runtime={runtime})" if runtime else ""
+    print(f"Running {len(shard_paths)} shards with {workers} parallel container(s).{rt_msg}", flush=True)
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = [ex.submit(worker) for _ in range(workers)]

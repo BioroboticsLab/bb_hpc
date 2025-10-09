@@ -61,7 +61,7 @@ def host_to_container_path(path: Path, host_bind: Path, container_bind: Path) ->
     rel = path.relative_to(host_bind)
     return str(container_bind / rel)
 
-def docker_run_cmd(image, gpu_id, binds, env, runner_path, filelist_container):
+def docker_run_cmd(image, gpu_id, binds, env, runner_path, filelist_container, runtime=None):
     # Use a tiny bash prelude so we can activate conda if present & set PYTHONPATH etc.
     bash = f"""set -euo pipefail
 if [ -f /opt/conda/etc/profile.d/conda.sh ]; then
@@ -72,7 +72,10 @@ export PYTHONPATH="{settings.docker.get('env', {}).get('PYTHONPATH', '')}:${{PYT
 export LD_LIBRARY_PATH="/opt/conda/envs/beesbook/lib:${{LD_LIBRARY_PATH:-}}"
 python -u {runner_path} "{filelist_container}"
 """
-    parts = ["docker", "run", "--rm", "--gpus", f"device={gpu_id}"]
+    parts = ["docker", "run", "--rm"]
+    if runtime:
+        parts += ["--runtime", runtime]
+    parts += ["--gpus", f"device={gpu_id}"]
     for k, v in env.items():
         parts += ["-e", f"{k}={v}"]
     for host_p, cont_p in binds:
@@ -80,7 +83,7 @@ python -u {runner_path} "{filelist_container}"
     parts += [image, "bash", "-lc", bash]
     return parts
 
-def worker_loop(gpu_id, queue, bind_pairs, image, env, runner_path, jobdir_host):
+def worker_loop(gpu_id, queue, bind_pairs, image, env, runner_path, jobdir_host, runtime=None):
     bind_map = [(Path(h), Path(c)) for (h, c) in bind_pairs]
     chosen = None
     for h, c in bind_map:
@@ -99,7 +102,7 @@ def worker_loop(gpu_id, queue, bind_pairs, image, env, runner_path, jobdir_host)
         except IndexError:
             return
         filelist_container = host_to_container_path(filelist_host, host_bind, cont_bind)
-        cmd = docker_run_cmd(image, gpu_id, bind_pairs, env, runner_path, filelist_container)
+        cmd = docker_run_cmd(image, gpu_id, bind_pairs, env, runner_path, filelist_container, runtime=runtime)
         print(f"[GPU {gpu_id}] starting: {shlex.join(cmd)}", flush=True)
         rc = subprocess.call(cmd)
         print(f"[GPU {gpu_id}] finished {filelist_host.name} -> rc={rc}", flush=True)
@@ -158,13 +161,16 @@ def main():
     # Pass CLAHE down to the container explicitly (runner reads RPI_CLAHE)
     env["RPI_CLAHE"] = "1" if args.clahe else "0"
     binds      = dkr.get("binds", [])
+    runtime    = dkr.get("runtime")
+    if runtime:
+        print(f"Using Docker runtime: {runtime}")
 
     # Fan out workers
     queue = list(filelists)
     with ThreadPoolExecutor(max_workers=len(gpu_plan)) as ex:
         futs = []
         for gid in gpu_plan:
-            futs.append(ex.submit(worker_loop, gid, queue, binds, image, env, runner, jobdir_host))
+            futs.append(ex.submit(worker_loop, gid, queue, binds, image, env, runner, jobdir_host, runtime))
         for _ in as_completed(futs):
             pass
 
