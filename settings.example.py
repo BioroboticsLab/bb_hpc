@@ -189,6 +189,7 @@ k8s = {
 docker = {
     # Reuse the same image & runner used in k8s
     "image": os.environ.get("DOCKER_IMAGE", "jacobdavidson/beesbook:latest"),
+    "runtime": "nvidia",
     "runner_path": os.path.join(bb_hpc_dir_hpc, "running_k8s/run_videos.py"),
     "runner_path_rpi": os.path.join(bb_hpc_dir_hpc, "running_k8s/run_rpi_videos.py"),
     "runner_path_save_detect": os.path.join(bb_hpc_dir_hpc, "running_k8s/run_save_detect.py"),

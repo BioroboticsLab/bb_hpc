@@ -54,20 +54,14 @@ def write_filelist(dir_host: Path, idx: int, job_args_list):
 
 
 def make_indexed_job(job_name: str, completions: int, parallelism: int,
-                     filelist_dir_pod: str, runner_path: str):
+                     filelist_dir_pod: str, runner_path: str,
+                     env_list: list[dict], resources: dict):
     """
     Build a single Job with Indexed completions.
     Each Pod computes: FILELIST=.../tracking_${JOB_COMPLETION_INDEX}.txt
     and then runs N shard workers in parallel on the same GPU.
     """
     k = settings.k8s
-
-    # Env passed via Kubernetes
-    env_list = [{"name": k_, "value": str(v_)} for k_, v_ in k.get("env", {}).items()]
-    # Default WORKERS_PER_GPU if not provided
-    if not any(e["name"] == "WORKERS_PER_GPU" for e in env_list):
-        wpg = str(k.get("job", {}).get("workers_per_gpu", 2))
-        env_list.append({"name": "WORKERS_PER_GPU", "value": wpg})
 
     bash = f"""\
 set -euo pipefail
@@ -89,7 +83,7 @@ printf -v idx5 "%05d" "$idx"
 fl="{filelist_dir_pod}/tracking_${{idx5}}.txt"
 echo "JOB_COMPLETION_INDEX=$idx -> filelist=$fl"
 
-# Run N workers in parallel on this GPU
+# Run N workers in parallel on this node (GPU if requested)
 WORKERS="${{WORKERS_PER_GPU:-2}}"
 echo "WORKERS_PER_GPU=${{WORKERS}}"
 
@@ -136,7 +130,7 @@ exit $rc
                         "name": "tracking",
                         "image": k["image"],
                         "command": ["bash", "-lc", bash],
-                        "resources": k["resources"],
+                        "resources": resources,
                         "env": env_list,
                         "volumeMounts": k["volume_mounts"],
                         "tty": True,
@@ -172,6 +166,30 @@ def main():
     maxjobs        = s.get("maxjobs", None)
     interval_hours = int(s.get("interval_hours", 1))
     temp_dir       = s.get("temp_path", "/tmp/bb_tracking_tmp")
+
+    # Determine GPU/CPU mode and resources
+    gpu_enabled = bool(s.get("gpu", True))
+
+    # Base env from Kubernetes settings
+    base_env = [{"name": k_, "value": str(v_)} for k_, v_ in settings.k8s.get("env", {}).items()]
+
+    # Ensure WORKERS_PER_GPU is present (used as workers per Pod even in CPU mode)
+    if not any(e["name"] == "WORKERS_PER_GPU" for e in base_env):
+        wpg = str(settings.k8s.get("job", {}).get("workers_per_gpu", 2))
+        base_env.append({"name": "WORKERS_PER_GPU", "value": wpg})
+
+    # In CPU-only mode, explicitly hide GPUs to frameworks
+    if not gpu_enabled:
+        base_env.append({"name": "CUDA_VISIBLE_DEVICES", "value": ""})
+        # Optional (harmless if NVIDIA runtime isn't used):
+        base_env.append({"name": "NVIDIA_VISIBLE_DEVICES", "value": "none"})
+    
+    # Pick resources: allow per-job overrides, otherwise fall back to global k8s resources
+    if gpu_enabled:
+        resources = settings.k8s.get("resources_tracking_gpu", settings.k8s.get("resources", {}))
+    else:
+        resources = settings.k8s.get("resources_tracking_cpu", {"requests": {"cpu": "2", "memory": "8Gi"},
+                                                               "limits":   {"cpu": "2", "memory": "8Gi"}})
 
     # Build local→HPC mapping pairs for repo/save/temp/jobdir
     mapping_pairs = [
@@ -213,6 +231,8 @@ def main():
         parallelism      = par,
         filelist_dir_pod = str(filelist_dir_pod),
         runner_path      = runner_path,
+        env_list         = base_env,
+        resources        = resources,
     )
 
     spec_path = filelist_dir_host / f"{full_job_name}.json"

@@ -79,6 +79,10 @@ export LD_LIBRARY_PATH="/opt/conda/envs/beesbook/lib:${{LD_LIBRARY_PATH:-}}"
 python -u {runner_path} "{filelist_container}"
 """
     parts = ["docker", "run", "--rm", "--gpus", f"device={gpu_id}"]
+    # Allow forcing a specific container runtime (e.g., nvidia)
+    runtime = settings.docker.get("runtime")
+    if runtime:
+        parts += ["--runtime", str(runtime)]
     for k, v in env.items():
         parts += ["-e", f"{k}={v}"]
     for host_p, cont_p in binds:
