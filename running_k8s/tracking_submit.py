@@ -83,9 +83,14 @@ printf -v idx5 "%05d" "$idx"
 fl="{filelist_dir_pod}/tracking_${{idx5}}.txt"
 echo "JOB_COMPLETION_INDEX=$idx -> filelist=$fl"
 
-# Run N workers in parallel on this node (GPU if requested)
-WORKERS="${{WORKERS_PER_GPU:-2}}"
-echo "WORKERS_PER_GPU=${{WORKERS}}"
+# Decide workers: GPU mode uses WORKERS_PER_GPU, CPU mode uses WORKERS_PER_POD
+if [ "${{GPU_ENABLED:-1}}" = "1" ]; then
+  WORKERS="${{WORKERS_PER_GPU:-2}}"
+  echo "GPU mode: WORKERS_PER_GPU=${{WORKERS}}"
+else
+  WORKERS="${{WORKERS_PER_POD:-2}}"
+  echo "CPU mode: WORKERS_PER_POD=${{WORKERS}}"
+fi
 
 tmpd="$(mktemp -d)"
 split -n "l/${{WORKERS}}" -d -a 2 "$fl" "${{tmpd}}/shard_"
@@ -173,10 +178,16 @@ def main():
     # Base env from Kubernetes settings
     base_env = [{"name": k_, "value": str(v_)} for k_, v_ in settings.k8s.get("env", {}).items()]
 
-    # Ensure WORKERS_PER_GPU is present (used as workers per Pod even in CPU mode)
+    # Ensure worker env knobs are present
     if not any(e["name"] == "WORKERS_PER_GPU" for e in base_env):
         wpg = str(settings.k8s.get("job", {}).get("workers_per_gpu", 2))
         base_env.append({"name": "WORKERS_PER_GPU", "value": wpg})
+    if not any(e["name"] == "WORKERS_PER_POD" for e in base_env):
+        wpp = str(settings.k8s.get("job", {}).get("workers_per_pod", 2))
+        base_env.append({"name": "WORKERS_PER_POD", "value": wpp})
+
+    # Flag to tell the entrypoint which worker knob to use
+    base_env.append({"name": "GPU_ENABLED", "value": "1" if gpu_enabled else "0"})
 
     # In CPU-only mode, explicitly hide GPUs to frameworks
     if not gpu_enabled:

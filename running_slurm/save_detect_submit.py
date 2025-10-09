@@ -72,6 +72,7 @@ def main():
 
     # Create inputs + batch file
     job.clear_input_files = lambda: None # this is needed so that createjobs() does not delete existing input files    job.createjobs()
+    job.createjobs()
     job.write_batch_file()
 
     if args.dry_run:

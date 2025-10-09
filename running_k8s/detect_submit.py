@@ -17,6 +17,8 @@ def parse_args():
                    help="YYYYMMDD strings (UTC). Default: yesterday & today.")
     p.add_argument("--dry-run", action="store_true",
                    help="Write filelists & Job spec, but do not kubectl apply.")
+    p.add_argument("--use-fileinfo", action="store_true",
+                   help="Use fileinfo to skip already processed videos and speed up job generation.")
     return p.parse_args()
 
 
@@ -162,6 +164,17 @@ def main():
     video_hpc   = Path(settings.videodir_hpc)
     repo_local  = Path(settings.pipeline_root_local)
 
+    # Resolve result_local similarly to Docker detect_submit to allow skipping already processed videos
+    # This speeds up job generation by avoiding re-processing videos with existing results.
+    result_local = None
+    if hasattr(settings, "resultdir_local") and settings.resultdir_local:
+        result_local = Path(settings.resultdir_local)
+    else:
+        # Try to infer from pipeline_root_local if possible
+        inferred = repo_local.parent / "results"
+        if inferred.exists():
+            result_local = inferred
+
     # Where to write filelists on the submission machine (LOCAL) and
     # where the Pod will read the same directory (HPC path)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -178,6 +191,8 @@ def main():
         maxjobs          = s.get("maxjobs", None),
         datestring       = args.dates,
         verbose          = False,
+        RESULTDIR        = result_local,
+        use_fileinfo     = bool(args.use_fileinfo),
     ))
     if not chunks:
         print("No work to submit.")
