@@ -1,0 +1,143 @@
+###############################################################################
+# Dockerfile-comb-background (micromamba edition)
+# - CUDA-ready NGC base
+# - Python 3.12 via conda-forge (micromamba)
+# - Poetry installs into the same env (no separate venv)
+###############################################################################
+FROM nvcr.io/nvidia/pytorch:24.08-py3 AS base
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# OS deps
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      git ffmpeg curl ca-certificates bzip2 && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install micromamba (no TOS prompts, uses conda-forge)
+ENV MAMBA_ROOT_PREFIX=/opt/micromamba
+RUN curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
+    -o /usr/local/bin/micromamba && \
+    chmod +x /usr/local/bin/micromamba
+
+# Create env with Python 3.12 + pip + poetry (conda-forge only)
+RUN micromamba create -y -n combbg -c conda-forge python=3.12 pip poetry && \
+    micromamba clean --all --yes
+
+# Make env available on PATH for subsequent RUNs
+ENV PATH="${MAMBA_ROOT_PREFIX}/envs/combbg/bin:${PATH}"
+
+WORKDIR /workspace
+
+# Configure Poetry to install into the current env (no venvs)
+RUN micromamba run -n combbg poetry --version && \
+    micromamba run -n combbg poetry config virtualenvs.create false
+
+# Clone and install the background generator into the combbg env
+RUN git clone --depth=1 https://github.com/danielsturm/honeybee_cell_segmentation_pipeline.git && \
+    micromamba run -n combbg bash -lc '\
+      cd honeybee_cell_segmentation_pipeline/background_img_generator && \
+      poetry install --no-interaction --no-ansi && \
+      # Ensure CUDA-enabled Torch in this env (for segmentation-models-pytorch)
+      python -m pip install --index-url https://download.pytorch.org/whl/cu126 \
+          torch torchvision torchaudio \
+    '
+
+# Build-time sanity check (in the same env)
+RUN micromamba run -n combbg python - <<'PY'
+import torch, sys
+print('Torch:', torch.__version__)
+print('CUDA available:', torch.cuda.is_available())
+sys.exit(0)
+PY
+
+# Symlink ffmpeg for the frame extractor expected path
+RUN bash -lc '\
+  cd honeybee_cell_segmentation_pipeline/background_img_generator && \
+  mkdir -p frame_extractor/bin && \
+  if command -v ffmpeg >/dev/null 2>&1; then \
+      ln -sf "$(command -v ffmpeg)" frame_extractor/bin/ffmpeg; \
+      echo "Symlinked ffmpeg"; \
+  else \
+      echo "WARNING: ffmpeg not found"; \
+  fi \
+'
+
+CMD ["/bin/bash"]
+###############################################################################
+# Dockerfile-comb-background (Miniforge edition)
+# - CUDA-ready NGC base
+# - Python 3.12 via conda-forge (Miniforge)
+# - Poetry installs into the same conda env (no separate venv)
+###############################################################################
+FROM nvcr.io/nvidia/pytorch:24.08-py3 AS base
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# OS deps
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      git ffmpeg wget ca-certificates bzip2 && \
+    rm -rf /var/lib/apt/lists/*
+
+# Download & install Miniforge3 (conda-forge’s lightweight installer)
+RUN wget --quiet \
+      https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh \
+    -O /tmp/miniforge.sh && \
+    bash /tmp/miniforge.sh -b -p /opt/conda && \
+    rm /tmp/miniforge.sh
+
+# Put conda on the PATH and disable auto-activation of base
+ENV PATH="/opt/conda/bin:$PATH" \
+    CONDA_AUTO_ACTIVATE_BASE="false"
+
+# Use bash login shell so "conda" and "activate" work naturally
+SHELL ["/bin/bash", "-lc"]
+
+# Create conda env with Python 3.12 and pip
+RUN set -euo pipefail && \
+    conda create -y -n combbg python=3.12 pip && \
+    conda clean -a -y
+
+# Make the env default on PATH for subsequent RUNs
+ENV CONDA_DEFAULT_ENV=combbg \
+    PATH="/opt/conda/envs/combbg/bin:$PATH"
+
+WORKDIR /workspace
+
+# Install Poetry into the conda env and configure it to avoid creating its own venv
+RUN set -euo pipefail && \
+    pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir poetry && \
+    poetry --version && \
+    poetry config virtualenvs.create false
+
+# Clone and install the background generator into the combbg env
+RUN set -euo pipefail && \
+    git clone --depth=1 https://github.com/danielsturm/honeybee_cell_segmentation_pipeline.git && \
+    cd honeybee_cell_segmentation_pipeline/background_img_generator && \
+    poetry install --no-interaction --no-ansi && \
+    # Ensure CUDA-enabled Torch in this env (for segmentation-models-pytorch)
+    python -m pip install --index-url https://download.pytorch.org/whl/cu126 \
+        torch torchvision torchaudio
+
+# Build-time sanity check (in the same env)
+RUN python - <<'PY'
+import torch, sys
+print('Torch:', torch.__version__)
+print('CUDA available:', torch.cuda.is_available())
+sys.exit(0)
+PY
+
+# Symlink ffmpeg for the frame extractor expected path
+RUN set -euo pipefail && \
+  cd honeybee_cell_segmentation_pipeline/background_img_generator && \
+  mkdir -p frame_extractor/bin && \
+  if command -v ffmpeg >/dev/null 2>&1; then \
+      ln -sf "$(command -v ffmpeg)" frame_extractor/bin/ffmpeg; \
+      echo "Symlinked ffmpeg"; \
+  else \
+      echo "WARNING: ffmpeg not found"; \
+  fi
+
+CMD ["/bin/bash"]

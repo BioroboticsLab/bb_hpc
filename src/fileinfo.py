@@ -1,39 +1,189 @@
 import os, glob
 import pandas as pd
 from bb_binary.parsing import parse_video_fname
+from pathlib import Path
+
+import sys, shlex, subprocess
 
 import bb_binary
-from datetime import datetime 
+from datetime import datetime, timezone
 
 bbb = bb_binary.common.bbb
 
 #################################################################
 ##### listing functions for making database of existing and already processed videos
 #################################################################
-def list_bbb_files(pipeline_root):
+
+def _latest_div_mtime(day_dir: Path) -> datetime | None:
     """
-    Scan the entire bb_binary repository for .bbb files,
-    record their time windows and modification times,
-    and write the full catalog to a parquet.
-    Intended to run every 8 hours (e.g. via cron).
+    For a given day directory (YYYY/MM/DD), return the newest mtime among all
+    *minute-div* directories located at: YYYY/MM/DD/HH/<minute-div>.
+    We use GNU find to avoid Python per-entry stat calls on large trees.
+
+    Returns a timezone-aware UTC datetime, or None if none found.
     """
-    rows = []
-    for root, _, files in os.walk(pipeline_root):
-        print(root)
-        for f in files:
-            if not f.endswith('.bbb'):
+    import subprocess, shlex
+    try:
+        # From the day_dir, minute-div dirs are depth 2: HH (1) / minute-div (2)
+        cmd = (
+            f"find {shlex.quote(str(day_dir))} "
+            f"-mindepth 2 -maxdepth 2 -type d -printf '%T@\\n'"
+        )
+        out = subprocess.check_output(["bash", "-lc", cmd], stderr=subprocess.DEVNULL)
+        newest = None
+        for line in out.splitlines():
+            try:
+                t = float(line.decode("utf-8", "replace").strip())
+                dt = datetime.fromtimestamp(t, tz=timezone.utc)
+                if newest is None or dt > newest:
+                    newest = dt
+            except Exception:
                 continue
-            path = os.path.join(root, f)
-            mtime = datetime.fromtimestamp(os.stat(path).st_mtime)
-            _, start, end = parse_video_fname(f)
-            rows.append({
-                'file_name': f,
-                'full_path': path,
-                'starttime': start,
-                'endtime': end,
-                'modified_time': mtime
-            })
-    return pd.DataFrame(rows)
+        return newest
+    except Exception:
+        # Fallback: try the day_dir mtime; if that fails, return None
+        try:
+            return datetime.fromtimestamp(day_dir.stat().st_mtime, tz=timezone.utc)
+        except Exception:
+            return None
+
+def _safe_subdirs(p: Path):
+    try:
+        for q in p.iterdir():
+            try:
+                if q.is_dir():
+                    yield q
+            except OSError:
+                continue
+    except (FileNotFoundError, PermissionError, OSError):
+        return
+
+def list_bbb_files_incremental(pipeline_root: str, cache_dir: str) -> pd.DataFrame:
+    """
+    Cache daily catalogs under cache_dir/daily/bbb_YYYYMMDD.parquet.
+    Only rescan days that are missing or whose *minute-div* directory mtime
+    (YYYY/MM/DD/HH/<minute-div>) is newer than the cached parquet.
+    """
+    daily_dir = Path(cache_dir) / "daily"
+    daily_dir.mkdir(parents=True, exist_ok=True)
+
+    # Discover day folders (YYYY/MM/DD) without deep walking.
+    day_paths: list[Path] = []
+    pr = Path(pipeline_root)
+    for y in sorted(_safe_subdirs(pr)):
+        for m in sorted(_safe_subdirs(y)):
+            for d in sorted(_safe_subdirs(m)):
+                day_paths.append(d)
+
+    dfs = []
+    for d in day_paths:
+        day_str = "/".join(d.parts[-3:])  # YYYY/MM/DD
+        print(day_str)
+        out_pq = daily_dir / f"bbb_{day_str.replace('/','')}.parquet"
+
+        # Compute deepest relevant mtime: newest of any minute-div dir under the day.
+        deep_mtime = _latest_div_mtime(d)
+
+        # If cache exists and is at least as new as deepest mtime, trust it.
+        try:
+            if out_pq.exists():
+                pq_mtime = datetime.fromtimestamp(out_pq.stat().st_mtime, tz=timezone.utc)
+                if deep_mtime is None or pq_mtime >= deep_mtime:
+                    try:
+                        dfs.append(pd.read_parquet(out_pq))
+                        continue
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Rescan this day only
+        print("...reindexing")
+        df_day = list_bbb_files(str(d))
+        try:
+            df_day.to_parquet(out_pq, index=False)
+        except Exception:
+            pass
+        dfs.append(df_day)
+
+    if dfs:
+        return pd.concat(dfs, ignore_index=True)
+    return pd.DataFrame(columns=["file_name","full_path","starttime","endtime","modified_time"])
+
+def list_bbb_files(pipeline_root: str) -> pd.DataFrame:
+    """
+    Fast scanner for .bbb files using GNU find, dramatically reducing metadata round-trips.
+    Falls back to a scandir-based walk if GNU find is unavailable.
+    Returns a DataFrame with columns:
+      ['file_name','full_path','starttime','endtime','modified_time']
+    """
+    def _from_find(root: str) -> pd.DataFrame:
+        # %P  = path relative to the starting point
+        # %T@ = mtime as seconds since epoch (float)
+        cmd = (
+            f"find {shlex.quote(root)} -type f -name '*.bbb' "
+            r"-printf '%P\t%T@\n'"
+        )
+        out = subprocess.check_output(["bash", "-lc", cmd], stderr=subprocess.DEVNULL)
+        rows = []
+        append = rows.append
+        for line in out.splitlines():
+            try:
+                rel, mtime_epoch = line.decode("utf-8", "replace").rstrip("\n").split("\t", 1)
+                full = os.path.join(root, rel)
+                fname = os.path.basename(rel)
+                # parse start/end from BBB filename (mirrors video naming)
+                _cam, start, end = parse_video_fname(fname)
+                mtime = datetime.fromtimestamp(float(mtime_epoch), tz=timezone.utc)
+                append({
+                    "file_name": fname,
+                    "full_path": full,
+                    "starttime": start,
+                    "endtime": end,
+                    "modified_time": mtime,
+                })
+            except Exception:
+                # Skip any malformed lines/filenames rather than stalling the run
+                continue
+        return pd.DataFrame(rows)    
+
+    def _fallback_scandir(root: str) -> pd.DataFrame:
+        # If GNU find isn't available, use scandir (faster than os.walk + os.stat)
+        rows = []
+        append = rows.append
+        stack = [root]
+        while stack:
+            d = stack.pop()
+            try:
+                with os.scandir(d) as it:
+                    for entry in it:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False) and entry.name.endswith(".bbb"):
+                            fname = entry.name
+                            full = entry.path
+                            try:
+                                st = entry.stat(follow_symlinks=False)
+                                mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+                                _cam, start, end = parse_video_fname(fname)
+                                append({
+                                    "file_name": fname,
+                                    "full_path": full,
+                                    "starttime": start,
+                                    "endtime": end,
+                                    "modified_time": mtime,
+                                })
+                            except Exception:
+                                continue
+            except PermissionError:
+                continue
+        return pd.DataFrame(rows)
+
+    # Try fast path (GNU find). If that fails, use Python fallback.
+    try:
+        return _from_find(pipeline_root)
+    except Exception:
+        return _fallback_scandir(pipeline_root)
 
 
 def build_outinfo(output_dir, CACHE_DIR, extension, outname):
@@ -43,7 +193,7 @@ def build_outinfo(output_dir, CACHE_DIR, extension, outname):
     for path in glob.glob(pattern):
         fname = os.path.basename(path)
         cam_id, start, end = parse_video_fname(fname.replace(f'.{extension}',''))
-        mtime = datetime.fromtimestamp(os.path.getmtime(path))
+        mtime = datetime.fromtimestamp(os.path.getmtime(path), tz=timezone.utc)
         rows.append({
             'cam_id': cam_id,
             'from_dt': start,

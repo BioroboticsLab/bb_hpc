@@ -42,8 +42,7 @@ docker buildx build \
   -t jacobdavidson/beesbook-step6:latest \
   .
 
-
-## STEP 7
+## FINAL IMAGE
 docker buildx build \
   --platform linux/amd64 \
   -t jacobdavidson/beesbook:latest \

@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 # --- import settings + helpers from your package ---
 try:
     from bb_hpc import settings
-    from bb_hpc.src.fileinfo import list_bbb_files, build_outinfo
+    from bb_hpc.src.fileinfo import list_bbb_files, list_bbb_files_incremental,  build_outinfo
 except Exception as e:
     print(f"ERROR: could not import bb_hpc modules: {e}", file=sys.stderr)
     sys.exit(1)
@@ -64,9 +64,12 @@ def _pick_paths(prefer: str | None = None) -> tuple[str, str]:
     return pr_local or pr_hpc, rd_local or rd_hpc
 
 
-def build_bbb_info_parquet(pipeline_root: str, cache_dir: str) -> str:
+def build_bbb_info_parquet(pipeline_root: str, cache_dir: str, recalc: bool) -> str:
     os.makedirs(cache_dir, exist_ok=True)
-    df = list_bbb_files(pipeline_root)
+    if recalc:
+        df = list_bbb_files(pipeline_root)
+    else:
+        df = list_bbb_files_incremental(pipeline_root, cache_dir)
     today = datetime.now(timezone.utc).strftime("%Y%m%d")
     out_path = os.path.join(cache_dir, f"bbb_info_{today}.parquet")
     df.to_parquet(out_path, index=False)
@@ -112,6 +115,14 @@ def parse_args():
         default="all",
         help="Which caches to (re)build: all, only bbb catalog, or only outputs catalogs.",
     )
+    # ✅ use-cache replaces recalc, inverted logic
+    p.add_argument(
+        "--use-cache",
+        dest="use_cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use existing cached BBB file info (default: true). Use --no-use-cache to force full recalculation.",
+    )
     return p.parse_args()
 
 
@@ -130,11 +141,11 @@ def main():
     print(f"[config] resultdir     = {resultdir}")
     print(f"[config] cache_dir     = {cache_dir}")
     print(f"[config] mode          = {args.what}")
-
-    # NOTE: Parquet requires pyarrow or fastparquet; ensure your environment has one installed.
+    print(f"[config] use_cache     = {args.use_cache}")
 
     if args.what in ("all", "bbb"):
-        build_bbb_info_parquet(pipeline_root, cache_dir)
+        # invert logic: recalc = not use_cache
+        build_bbb_info_parquet(pipeline_root, cache_dir, recalc=not args.use_cache)
 
     if args.what in ("all", "outputs"):
         build_outinfo_parquets(resultdir, cache_dir)

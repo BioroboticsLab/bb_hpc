@@ -3,7 +3,8 @@
 #   - Start from NVIDIA’s PyTorch image (CUDA 12.8 + cuDNN + PyTorch preinstalled)
 #   - Install all system-level libraries (Git, ffmpeg, OpenCV, etc.)
 ###############################################################################
-FROM nvcr.io/nvidia/pytorch:23.10-py3 AS step1
+#FROM nvcr.io/nvidia/pytorch:23.10-py3 AS step1
+FROM nvcr.io/nvidia/pytorch:24.08-py3 AS step1
 
 ENV DEBIAN_FRONTEND=noninteractive
 
