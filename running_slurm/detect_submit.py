@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from slurmhelper import SLURMJob
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 import argparse, time
 import re
 
@@ -20,6 +21,11 @@ def parse_args():
         "--dates", nargs="+",
         default=[yesterday, today],
         help="YYYYMMDD strings to scan (default: yesterday & today, UTC)"
+    )
+    p.add_argument(
+        "--use-fileinfo",
+        action="store_true",
+        help="Use fileinfo to skip already processed videos and speed up job generation."
     )
     return p.parse_args()
 
@@ -57,6 +63,18 @@ def main():
     videodir = getattr(settings, "videodir_hpc", getattr(settings, "videodir", None))
     pipeline_root = getattr(settings, "pipeline_root_hpc", getattr(settings, "pipeline_root", None))
 
+    # Prefer resultdir on HPC for fileinfo-based skipping (shared FS)
+    resultdir = getattr(settings, "resultdir_hpc", getattr(settings, "resultdir", None))
+    if not resultdir:
+        # Try to infer from pipeline_root_hpc if not explicitly set
+        try:
+            pr_path = Path(pipeline_root)
+            inferred = pr_path.parent / "results"
+            if inferred.exists():
+                resultdir = str(inferred)
+        except Exception:
+            resultdir = None
+
     if not all([jobdir, videodir, pipeline_root]):
         raise RuntimeError("Missing required directory settings (jobdir/videodir/pipeline_root). Check settings.py.")
 
@@ -82,6 +100,8 @@ def main():
             maxjobs=maxjobs,
             datestring=args.dates,
             verbose=False,
+            RESULTDIR=resultdir,
+            use_fileinfo=bool(args.use_fileinfo),
         )
     )
 
