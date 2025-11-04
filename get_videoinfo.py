@@ -65,16 +65,26 @@ def _iter_all_day_dirs(video_root: str) -> Iterable[str]:
     Yield absolute paths to top-level YYYYMMDD directories under video_root.
     (No date filtering; we scan them all.)
     """
+    def is_valid_dir(name: str) -> bool:
+        # Accept YYYYMMDD (8 digits) or YYYY-MM-DD (10 chars with hyphens at pos 4 and 7)
+        if len(name) == 8 and name.isdigit():
+            return True
+        if len(name) == 10 and name[4] == '-' and name[7] == '-':
+            y, m, d = name.split('-')
+            if y.isdigit() and m.isdigit() and d.isdigit():
+                return True
+        return False
+
     try:
         with os.scandir(video_root) as it:
             for e in it:
-                if e.is_dir(follow_symlinks=False) and len(e.name) == 8 and e.name.isdigit():
+                if e.is_dir(follow_symlinks=False) and is_valid_dir(e.name):
                     yield e.path
     except PermissionError:
         # best-effort
         for name in os.listdir(video_root):
             p = os.path.join(video_root, name)
-            if os.path.isdir(p) and len(name) == 8 and name.isdigit():
+            if os.path.isdir(p) and is_valid_dir(name):
                 yield p
 
 

@@ -220,7 +220,7 @@ def get_bbb_file_path(video_basename):
     from bb_binary.parsing import parse_video_fname, get_video_fname
     import numpy as np
     # Parse the video filename to extract the cam_id and timestamp using bb_binary functions
-    cam_id, start, end = parse_video_fname(video_basename,format='basler')
+    cam_id, start, end = parse_video_fname(video_basename)
     # Convert the parsed timestamp to the expected directory structure (assumes UTC time)
     year = start.year
     month = str(start.month).zfill(2)
