@@ -12,6 +12,7 @@ tracking, and RPi-detect).
 ### Clone or link locally
 Clone the repository into your working directory, and install in editable mode (needed for editing settings) in your Python environment
 ```bash
+python -m pip install git+https://github.com/walachey/slurmhelper
 git clone https://github.com/BioroboticsLab/bb_hpc.git 
 pip install -e bb_hpc
 ```
