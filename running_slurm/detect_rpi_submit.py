@@ -5,7 +5,8 @@ import argparse, time
 import bb_hpc.settings as settings
 from slurmhelper import SLURMJob
 from bb_hpc.src.generate import generate_jobs_rpi_detect
-from bb_hpc.src.jobfunctions import job_for_process_rpi_videos  # <- adjust if your name differs
+from bb_hpc.src.jobfunctions import job_for_process_rpi_videos 
+from bb_hpc.src.slurm_utils import resolve_slurm_config, apply_slurm_to_job
 
 
 def parse_args():
@@ -19,38 +20,24 @@ def parse_args():
     )
     return p.parse_args()
 
-
-def _normalize_mem(mem):
-    """Convert '6GB' -> '6G'. Slurm also accepts integer MiB."""
-    if not mem:
-        return None
-    mem = str(mem).strip().upper()
-    return mem[:-2] + "G" if mem.endswith("GB") else mem
-
-
 def main():
     args = parse_args()
 
     # ---------- settings ----------
     s = settings.rpi_detect_settings
-    jobname = s.get("jobname", "rpi_detect")
+    base_slurm = settings.slurm
+    # Merge with "specific overrides general"
+    slurm_cfg = resolve_slurm_config(base_slurm, s)   
 
-    # Prefer HPC dirs for Slurm
-    jobdir        = getattr(settings, "jobdir_hpc", getattr(settings, "jobdir", None))
-    pi_videodir   = getattr(settings, "pi_videodir_hpc", getattr(settings, "pi_videodir", None))
-
-    if not all([jobdir, pi_videodir]):
-        raise RuntimeError("Missing required directory settings (jobdir/pi_videodir). Check settings.py.")
-
+    # Simplified: prefer unified HPC-style paths; fallback to legacy names
     chunk_size      = int(s.get("chunk_size", 150))
     use_clahe       = bool(s.get("use_clahe", True))
-    jobtime_minutes = int(s.get("jobtime_minutes", 60))
 
     # ---------- build per-shard jobs (list-of-videos) ----------
     # generate_jobs_rpi_detect(...) yields shards with "video_paths"
     jobs_kwargs = []
     for shard in generate_jobs_rpi_detect(
-        video_root_dir=str(pi_videodir),
+        video_root_dir=str(settings.pi_videodir_hpc),
         dates=args.dates,
         chunk_size=chunk_size,
         clahe=use_clahe,
@@ -65,28 +52,17 @@ def main():
         return
 
     # ---------- Slurm job object ----------
-    job = SLURMJob(jobname, jobdir)
+    job = SLURMJob(s.get("jobname", "rpi_detect"), settings.jobdir_hpc)
     job.map(job_for_process_rpi_videos, jobs_kwargs)
 
-    # Base Slurm config + RPi overrides
-    sl = dict(settings.slurm)
-    sl.update(s.get("slurm", {}))
+    apply_slurm_to_job(job, slurm_cfg) # Apply the merged config
 
-    job.qos                = sl.get("qos")
-    job.partition          = sl.get("partition")
-    job.custom_preamble    = sl.get("custom_preamble") or ""
-    job.max_memory         = _normalize_mem(sl.get("max_memory", "6G"))
-    job.n_cpus             = int(sl.get("n_cpus", 1))
-    job.max_job_array_size = sl.get("max_job_array_size", 500)
-    job.time_limit         = timedelta(minutes=jobtime_minutes)
-
-    # CPU-only (ensure no GPU request in the sbatch file)
-    job.n_gpus = 0
-
-    # Exports: inherit any global env exports and add CLAHE flag
-    base_exports = sl.get("exports", "OMP_NUM_THREADS=1,MKL_NUM_THREADS=1")
+    # Add CLAHE flag to exports while keeping what apply_slurm_to_job already set
     extra = "RPI_CLAHE={}".format("1" if use_clahe else "0")
-    job.exports = f"{base_exports},{extra}" if base_exports else extra
+    job.exports = f"{job.exports},{extra}" if getattr(job, "exports", "") else extra
+
+    # Harden: ensure n_gpus stays 0 for this CPU-only pipeline
+    job.n_gpus = 0
 
     # ---------- write & submit ----------
     job.clear_input_files = lambda: None # this is needed so that createjobs() does not delete existing input files

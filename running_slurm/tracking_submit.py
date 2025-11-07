@@ -8,6 +8,7 @@ from slurmhelper import SLURMJob
 
 from bb_hpc.src.generate import generate_jobs_tracking
 from bb_hpc.src.jobfunctions import job_for_tracking
+from bb_hpc.src.slurm_utils import resolve_slurm_config, apply_slurm_to_job
 
 
 def parse_args():
@@ -27,7 +28,9 @@ def main():
     args = parse_args()
 
     s_trk = settings.track_settings
-    s_sl  = settings.slurm
+    base_slurm = settings.slurm
+    # Merge with "specific overrides general"
+    slurm_cfg = resolve_slurm_config(base_slurm, s_trk)    
 
     # Build tracking jobs using the same knobs as your Docker submitter
     batches = list(generate_jobs_tracking(
@@ -58,24 +61,9 @@ def main():
         name=s_trk.get("jobname", "tracking"),
         job_root=settings.jobdir_hpc,
     )
-
     job.set_job_fun(job_for_tracking)
     job.set_job_arguments(job_args)
-
-    # Resources (CPU by default; set n_gpus in settings.slurm if you want GPU)
-    job.partition            = s_sl.get("partition", "dev")
-    job.qos                  = s_sl.get("qos", "standard")
-    job.time_limit           = timedelta(minutes=int(s_sl.get("jobtime_minutes", 180)))
-    job.max_memory           = s_sl.get("max_memory", "8GB")
-    job.n_nodes              = int(s_sl.get("nodes", 1))
-    job.n_cpus               = int(s_sl.get("cpus_per_task", 1))
-    job.n_tasks              = s_sl.get("ntasks_per_node", None)
-    job.n_gpus               = int(s_sl.get("n_gpus", 0))  # keep 0 unless you really need GPU tracking
-    job.nice                 = s_sl.get("nice", None)
-    job.concurrent_job_limit = s_sl.get("concurrent_job_limit", None)
-    job.max_job_array_size   = s_sl.get("max_job_array_size", "auto")
-    job.exports              = s_sl.get("exports", "")
-    job.custom_preamble      = s_sl.get("custom_preamble", "")
+    apply_slurm_to_job(job, slurm_cfg) # Apply the merged config
 
     # Generate input dill + batch file
     job.clear_input_files = lambda: None # this is needed so that createjobs() does not delete existing input files

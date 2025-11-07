@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 from slurmhelper import SLURMJob
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
 import argparse, time
-import re
 
 import bb_hpc.settings as settings
 from bb_hpc.src.generate import generate_jobs_detect
 from bb_hpc.src.jobfunctions import job_for_process_videos
+from bb_hpc.src.slurm_utils import resolve_slurm_config, apply_slurm_to_job
 
 
 # usage: python detect_submit.py --dates 20250710 20250709 ...
@@ -30,27 +29,6 @@ def parse_args():
     return p.parse_args()
 
 
-def _parse_gres_to_ngpus(gres_value):
-    """Accepts 'gpu:1', 'gpu:2', 1, 2, or None; returns int count."""
-    if gres_value is None:
-        return 0
-    if isinstance(gres_value, int):
-        return gres_value
-    s = str(gres_value).strip()
-    m = re.match(r"gpu:(\d+)", s, flags=re.IGNORECASE)
-    return int(m.group(1)) if m else 0
-
-def _normalize_mem(mem):
-    """Convert '6GB' -> '6G'. Slurm also accepts integer MiB."""
-    if not mem:
-        return None
-    mem = str(mem).strip().upper()
-    # Accept already-good forms like '6G' or '6144'
-    if mem.endswith("GB"):
-        return mem[:-2] + "G"
-    return mem
-
-
 def main():
     args = parse_args()
 
@@ -58,29 +36,14 @@ def main():
     s = settings.detect_settings
     jobname = s.get("jobname", "detect")
 
-    # Prefer HPC directories (this script submits to Slurm on the cluster).
-    jobdir = getattr(settings, "jobdir_hpc", getattr(settings, "jobdir", None))
-    videodir = getattr(settings, "videodir_hpc", getattr(settings, "videodir", None))
-    pipeline_root = getattr(settings, "pipeline_root_hpc", getattr(settings, "pipeline_root", None))
-
-    # Prefer resultdir on HPC for fileinfo-based skipping (shared FS)
-    resultdir = getattr(settings, "resultdir_hpc", getattr(settings, "resultdir", None))
-    if not resultdir:
-        # Try to infer from pipeline_root_hpc if not explicitly set
-        try:
-            pr_path = Path(pipeline_root)
-            inferred = pr_path.parent / "results"
-            if inferred.exists():
-                resultdir = str(inferred)
-        except Exception:
-            resultdir = None
-
-    if not all([jobdir, videodir, pipeline_root]):
-        raise RuntimeError("Missing required directory settings (jobdir/videodir/pipeline_root). Check settings.py.")
+    # HPC directories (required)
+    jobdir        = settings.jobdir_hpc
+    videodir      = settings.videodir_hpc
+    pipeline_root = settings.pipeline_root_hpc
+    resultdir     = settings.resultdir_hpc
 
     chunk_size = s.get("chunk_size", 4)
     maxjobs = s.get("maxjobs", None)
-    jobtime_minutes = s.get("jobtime_minutes", 60)
 
     # Create job
     job = SLURMJob(jobname, jobdir)
@@ -105,22 +68,9 @@ def main():
         )
     )
 
-    # --- Slurm knobs (from settings + per-job overrides) ---
-    sl = dict(settings.slurm)
-    sl.update(settings.detect_settings.get("slurm", {}))
-
-    job.qos                = sl.get("qos")
-    job.partition          = sl.get("partition")
-    job.custom_preamble    = sl.get("custom_preamble") or ""
-    job.max_memory         = _normalize_mem(sl.get("max_memory", "6G"))
-    job.n_cpus             = int(sl.get("n_cpus", 1))
-    job.max_job_array_size = sl.get("max_job_array_size", 500)
-    job.exports            = sl.get("exports", "OMP_NUM_THREADS=1,MKL_NUM_THREADS=1")
-    job.time_limit         = timedelta(minutes=jobtime_minutes)
-
-    # GPUs (to make #SBATCH --gres appear)
-    ngpus = _parse_gres_to_ngpus(sl.get("gres"))
-    job.n_gpus = ngpus  # write_batch_file() will emit '#SBATCH --gres=gpu:<n>'
+    # --- Slurm knobs (specific overrides global) ---
+    slurm_cfg = resolve_slurm_config(settings.slurm, settings.detect_settings)
+    apply_slurm_to_job(job, slurm_cfg)
 
     # submit
     job.clear_input_files = lambda: None # this is needed so that createjobs() does not delete existing input files
