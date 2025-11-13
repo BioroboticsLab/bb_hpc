@@ -20,7 +20,6 @@ def generate_jobs_detect(
     datestring="20*",
     verbose=False,
     video_glob_pattern="cam-*--*Z.mp4",
-    video_name_format="basler",
     use_fileinfo=False,          # use RESULTDIR/bbb_fileinfo/bbb_info_*.parquet
 ):
     """
@@ -48,8 +47,6 @@ def generate_jobs_detect(
         Verbose prints.
     video_glob_pattern : str
         Glob for videos inside each date directory.
-    video_name_format : str
-        Passed to parse_video_fname() (e.g., "basler").
     use_fileinfo : bool
         If True, use RESULTDIR/bbb_fileinfo/bbb_info_*.parquet to skip videos
         whose .bbb is already present. Otherwise, fall back to os.path.exists().
@@ -188,7 +185,7 @@ def generate_jobs_detect(
     # -------------------------------
     video_tuples = []
     for v in to_schedule:
-        cam_id, dt_start, _ = parse_video_fname(os.path.basename(v), format=video_name_format)
+        cam_id, dt_start, _ = parse_video_fname(os.path.basename(v))
         video_tuples.append((dt_start, cam_id, v))
     video_tuples.sort()
 
