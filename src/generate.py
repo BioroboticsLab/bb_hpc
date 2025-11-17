@@ -20,7 +20,7 @@ def generate_jobs_detect(
     datestring="20*",
     verbose=False,
     video_glob_pattern="cam-*--*Z.mp4",
-    use_fileinfo=False,          # use RESULTDIR/bbb_fileinfo/bbb_info_*.parquet
+    use_fileinfo=False,          # use RESULTDIR/bbb_fileinfo/*.parquet
 ):
     """
     Yield shards of videos to run detection on.
@@ -48,8 +48,9 @@ def generate_jobs_detect(
     video_glob_pattern : str
         Glob for videos inside each date directory.
     use_fileinfo : bool
-        If True, use RESULTDIR/bbb_fileinfo/bbb_info_*.parquet to skip videos
-        whose .bbb is already present. Otherwise, fall back to os.path.exists().
+        If True, use RESULTDIR/bbb_fileinfo/video_info_all.parquet to source raw
+        videos and bbb_info_*.parquet to skip videos whose .bbb already exists.
+        Otherwise, fall back to glob + os.path.exists().
 
     Yields
     ------
@@ -125,20 +126,45 @@ def generate_jobs_detect(
             existing_fnames   = None  # fallback
 
     # -------------------------------
-    # 3) glob raw mp4s (fast)
+    # 3) gather raw mp4s
     # -------------------------------
-    print("getting new mp4 files")
-    if isinstance(datestring, (list, tuple)):
-        days = list(datestring)
-    else:
-        days = [datestring]
+    all_videos = None
+    if use_fileinfo and RESULTDIR is not None:
+        video_info_path = os.path.join(RESULTDIR, "bbb_fileinfo", "video_info_all.parquet")
+        try:
+            df_videofiles = pd.read_parquet(video_info_path)
+            if verbose:
+                print(f"[fileinfo] loaded {len(df_videofiles)} rows from {video_info_path}")
 
-    patterns = (
-        os.path.join(video_root_dir, day, "**", video_glob_pattern)
-        for day in days
-    )
-    all_videos = list(chain.from_iterable(glob.iglob(p, recursive=True) for p in patterns))
-    print("found", len(all_videos), "files")
+            # Filter by requested dates using parsed starttime
+            dates = set(datestring if isinstance(datestring, (list, tuple)) else [datestring])
+            if "starttime" in df_videofiles.columns:
+                start_dt = pd.to_datetime(df_videofiles["starttime"], errors="coerce", utc=True)
+                mask = start_dt.dt.strftime("%Y%m%d").isin(dates)
+                df_videofiles = df_videofiles.loc[mask]
+            if "full_path" in df_videofiles.columns:
+                all_videos = df_videofiles["full_path"].dropna().astype(str).tolist()
+            if not all_videos:
+                print(f"[fileinfo] no matching entries for dates {dates}; falling back to glob")
+                all_videos = None
+        except FileNotFoundError:
+            print(f"[fileinfo] catalog not found: {video_info_path}; falling back to glob")
+        except Exception as e:
+            print(f"[fileinfo] error reading {video_info_path}: {e}; falling back to glob")
+
+    if all_videos is None:
+        print("getting new mp4 files")
+        if isinstance(datestring, (list, tuple)):
+            days = list(datestring)
+        else:
+            days = [datestring]
+
+        patterns = (
+            os.path.join(video_root_dir, day, "**", video_glob_pattern)
+            for day in days
+        )
+        all_videos = list(chain.from_iterable(glob.iglob(p, recursive=True) for p in patterns))
+        print("found", len(all_videos), "files")
 
     # -------------------------------
     # 4) filter (pending + already processed)
