@@ -60,14 +60,35 @@ def make_indexed_job(job_name: str, completions: int, parallelism: int,
 
     # Env passed via Kubernetes (includes your PYTHONPATH, TF_* flags, etc.)
     env_list = [{"name": k_, "value": str(v_)} for k_, v_ in k.get("env", {}).items()]
+    # Prefer CPU-only resources for RPi if provided
+    resources = k.get("resources_rpi", k["resources"])
 
     # Add CLAHE switch for the runner (runner reads RPI_CLAHE)
     env_list.append({"name": "RPI_CLAHE", "value": "1" if use_clahe else "0"})
 
-    # Inject WORKERS_PER_GPU if not already provided (even if CPU-only in cluster, this controls intra-pod fanout)
-    if not any(e["name"] == "WORKERS_PER_GPU" for e in env_list):
-        wpg = str(k.get("job", {}).get("workers_per_gpu", 2))
-        env_list.append({"name": "WORKERS_PER_GPU", "value": wpg})
+    # Choose worker env var based on whether this job requests GPUs
+    def _has_gpu(res_block: dict) -> bool:
+        for k2 in ("requests", "limits"):
+            gpu = res_block.get(k2, {}).get("nvidia.com/gpu")
+            if gpu is None:
+                continue
+            try:
+                if float(gpu) > 0:
+                    return True
+            except Exception:
+                if str(gpu).strip() not in ("0", "", "None"):
+                    return True
+        return False
+
+    workers_env_var = "WORKERS_PER_GPU" if _has_gpu(resources) else "WORKERS_PER_POD"
+
+    # Inject a default for the chosen workers var if not already present
+    if not any(e["name"] == workers_env_var for e in env_list):
+        default_workers = k.get("job", {}).get(
+            "workers_per_gpu" if workers_env_var == "WORKERS_PER_GPU" else "workers_per_pod",
+            2,
+        )
+        env_list.append({"name": workers_env_var, "value": str(default_workers)})
 
     # Bash payload:
     # - double the braces around any Bash ${...} usage so Python doesn't try to format them
@@ -92,8 +113,8 @@ fl="{filelist_dir_pod}/videos_${{idx5}}.txt"
 echo "JOB_COMPLETION_INDEX=$idx -> filelist=$fl"
 
 # ---- Run N workers in parallel on this Pod ----
-WORKERS="${{WORKERS_PER_GPU:-2}}"
-echo "WORKERS_PER_GPU=${{WORKERS}}"
+WORKERS="${{{workers_env_var}:-2}}"
+echo "{workers_env_var}=${{WORKERS}}"
 
 tmpd="$(mktemp -d)"
 # Split the filelist into N shards (line-balanced)
@@ -147,7 +168,7 @@ exit $rc
                         "name": "rpi-detect",
                         "image": k["image"],
                         "command": ["bash", "-lc", bash],
-                        "resources": k["resources"],
+                        "resources": resources,
                         "env": env_list,
                         "volumeMounts": k["volume_mounts"],
                         "tty": True,
