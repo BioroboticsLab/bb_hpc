@@ -38,7 +38,8 @@ def main():
         sys.exit(1)
 
     filelist = sys.argv[1]
-    use_clahe = True
+    # default from env/settings
+    use_clahe = USE_CLAHE
     if len(sys.argv) > 2 and sys.argv[2] == "--no-clahe":
         use_clahe = False
 
@@ -49,7 +50,7 @@ def main():
     with open(filelist) as f:
         videos = [line.strip() for line in f if line.strip()]
 
-    job_for_process_rpi_videos(videos)
+    job_for_process_rpi_videos(videos, clahe=use_clahe)
 
 if __name__ == "__main__":
     main()
