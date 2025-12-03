@@ -156,7 +156,7 @@ def main():
     # Docker/runtime bits
     dkr        = settings.docker
     image      = dkr["image"]
-    runner     = dkr.get("runner_path_rpi", "/abyss/home/jacob-davidson/cascbstorage/jacob/bb_hpc/running_k8s/run_rpi_videos.py")
+    runner     = dkr.get("runner_path_rpi", "running_k8s/run_rpi_videos.py")
     env        = dict(dkr.get("env", {}))  # copy
     # Pass CLAHE down to the container explicitly (runner reads RPI_CLAHE)
     env["RPI_CLAHE"] = "1" if args.clahe else "0"

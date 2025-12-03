@@ -47,6 +47,31 @@ def _latest_div_mtime(day_dir: Path) -> datetime | None:
         except Exception:
             return None
 
+def _latest_file_mtime(day_dir: Path) -> datetime | None:
+    """
+    Return the newest file mtime anywhere under day_dir (recursive).
+    Used for RPi daily caches where raw videos and detections live together.
+    """
+    import subprocess, shlex
+    try:
+        cmd = f"find {shlex.quote(str(day_dir))} -type f -printf '%T@\\n'"
+        out = subprocess.check_output(["bash", "-lc", cmd], stderr=subprocess.DEVNULL)
+        newest = None
+        for line in out.splitlines():
+            try:
+                t = float(line.decode("utf-8", "replace").strip())
+                dt = datetime.fromtimestamp(t, tz=timezone.utc)
+                if newest is None or dt > newest:
+                    newest = dt
+            except Exception:
+                continue
+        return newest
+    except Exception:
+        try:
+            return datetime.fromtimestamp(day_dir.stat().st_mtime, tz=timezone.utc)
+        except Exception:
+            return None
+
 def _safe_subdirs(p: Path):
     try:
         for q in p.iterdir():
@@ -57,6 +82,27 @@ def _safe_subdirs(p: Path):
                 continue
     except (FileNotFoundError, PermissionError, OSError):
         return
+
+def _list_rpi_day(day_dir: Path, day_str: str, video_glob_pattern: str) -> pd.DataFrame:
+    """
+    Build a per-day catalog of RPi videos and whether CLAHE / no-CLAHE detections exist.
+    """
+    rows = []
+    pattern = os.path.join(str(day_dir), "**", video_glob_pattern)
+    for path in glob.glob(pattern, recursive=True):
+        base = os.path.basename(path)
+        cam = base.rsplit("_", 1)[0] if "_" in base else ""
+        root, _ = os.path.splitext(path)
+        rows.append({
+            "date": day_str,
+            "cam": cam,
+            "video_name": base,
+            "full_path": path,
+            "detections_clahe": os.path.exists(root + "-detections-c.parquet"),
+            "detections_noclahe": os.path.exists(root + "-detections-nc.parquet"),
+        })
+    cols = ["date", "cam", "video_name", "full_path", "detections_clahe", "detections_noclahe"]
+    return pd.DataFrame(rows, columns=cols)
 
 def list_bbb_files_incremental(pipeline_root: str, cache_dir: str) -> pd.DataFrame:
     """
@@ -109,6 +155,52 @@ def list_bbb_files_incremental(pipeline_root: str, cache_dir: str) -> pd.DataFra
     if dfs:
         return pd.concat(dfs, ignore_index=True)
     return pd.DataFrame(columns=["file_name","full_path","starttime","endtime","modified_time"])
+
+def list_rpi_files_incremental(video_root: str, cache_dir: str, video_glob_pattern: str = "*.h264") -> pd.DataFrame:
+    """
+    Cache daily catalogs of RPi videos under cache_dir/daily/rpi_YYYYMMDD.parquet.
+    Only rescan a day if the newest file mtime under that day is newer than the cache.
+    """
+    daily_dir = Path(cache_dir) / "daily"
+    daily_dir.mkdir(parents=True, exist_ok=True)
+
+    vr = Path(video_root)
+    day_paths: list[Path] = []
+    for d in sorted(_safe_subdirs(vr)):
+        name = d.name
+        if len(name) == 8 and name.replace("-", "").isdigit():
+            day_paths.append(d)
+
+    dfs = []
+    for d in day_paths:
+        day_str = d.name
+        out_pq = daily_dir / f"rpi_{day_str.replace('-', '')}.parquet"
+
+        deep_mtime = _latest_file_mtime(d)
+        try:
+            if out_pq.exists():
+                pq_mtime = datetime.fromtimestamp(out_pq.stat().st_mtime, tz=timezone.utc)
+                if deep_mtime is None or pq_mtime >= deep_mtime:
+                    try:
+                        dfs.append(pd.read_parquet(out_pq))
+                        continue
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        print(day_str)
+        print("...reindexing RPi day")
+        df_day = _list_rpi_day(d, day_str, video_glob_pattern)
+        try:
+            df_day.to_parquet(out_pq, index=False)
+        except Exception:
+            pass
+        dfs.append(df_day)
+
+    if dfs:
+        return pd.concat(dfs, ignore_index=True)
+    return pd.DataFrame(columns=["date", "cam", "video_name", "full_path", "detections_clahe", "detections_noclahe"])
 
 def list_bbb_files(pipeline_root: str) -> pd.DataFrame:
     """

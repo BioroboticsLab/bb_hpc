@@ -32,6 +32,7 @@ def main():
     # Simplified: prefer unified HPC-style paths; fallback to legacy names
     chunk_size      = int(s.get("chunk_size", 150))
     use_clahe       = bool(s.get("use_clahe", True))
+    print('Use clahe:', use_clahe)
 
     # ---------- build per-shard jobs (list-of-videos) ----------
     # generate_jobs_rpi_detect(...) yields shards with "video_paths"
@@ -45,7 +46,7 @@ def main():
         vids = shard.get("video_paths", [])
         if vids:
             # job_for_process_rpi_videos(videos) expects the videos as a list
-            jobs_kwargs.append({"video_paths": vids})
+            jobs_kwargs.append({"video_paths": vids, "clahe": use_clahe})
 
     if not jobs_kwargs:
         print("Nothing to submit.")

@@ -199,7 +199,11 @@ def main():
     jobname       = s.get("jobname", "rpi-detect")
     full_job_name = f"{jobname}-{stamp}"
     par           = int(settings.k8s["job"].get("parallelism", 1))
-    runner_path   = settings.k8s.get("runner_path_rpi", "/workspace/run_rpi_videos.py")
+    # Default to the repo path mounted in the pod if not overridden in settings.k8s
+    runner_path   = settings.k8s.get(
+        "runner_path_rpi",
+        os.path.join(settings.bb_hpc_dir_hpc, "running_k8s/run_rpi_videos.py"),
+    )
 
     job_dict = make_indexed_job(
         job_name         = full_job_name,

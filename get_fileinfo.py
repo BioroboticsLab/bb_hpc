@@ -11,6 +11,9 @@ Generate/refresh fileinfo caches for BeesBook:
   3) <RESULTDIR>/bbb_fileinfo/save_tracking_outinfo.parquet
      - catalog of existing tracking outputs (.dill)
 
+  4) <RESULTDIR>/bbb_fileinfo/rpi_info_YYYYMMDD.parquet
+     - catalog of raw RPi videos and whether CLAHE/no-CLAHE detections exist
+
 This script is platform-agnostic:
 - Local, Slurm, K8s, or Docker — as long as `bb_hpc.settings` is importable
   and the directories are mounted/accessible, it will work.
@@ -27,7 +30,12 @@ from datetime import datetime, timezone
 # --- import settings + helpers from your package ---
 try:
     from bb_hpc import settings
-    from bb_hpc.src.fileinfo import list_bbb_files, list_bbb_files_incremental,  build_outinfo
+    from bb_hpc.src.fileinfo import (
+        list_bbb_files,
+        list_bbb_files_incremental,
+        list_rpi_files_incremental,
+        build_outinfo,
+    )
 except Exception as e:
     print(f"ERROR: could not import bb_hpc modules: {e}", file=sys.stderr)
     sys.exit(1)
@@ -62,6 +70,28 @@ def _pick_paths(prefer: str | None = None) -> tuple[str, str]:
 
     # Last resort: return whatever strings we have (may not exist yet)
     return pr_local or pr_hpc, rd_local or rd_hpc
+
+
+def _pick_pi_root(prefer: str | None = None) -> str:
+    """
+    Decide which pi_videodir to use (local vs hpc), preferring existing paths.
+    """
+    pi_local = getattr(settings, "pi_videodir_local", "")
+    pi_hpc   = getattr(settings, "pi_videodir_hpc", "")
+
+    def _exists(p: str) -> bool:
+        return bool(p) and os.path.exists(p)
+
+    if prefer == "local" and _exists(pi_local):
+        return pi_local
+    if prefer == "hpc" and _exists(pi_hpc):
+        return pi_hpc
+
+    if _exists(pi_local):
+        return pi_local
+    if _exists(pi_hpc):
+        return pi_hpc
+    return pi_local or pi_hpc
 
 
 def build_bbb_info_parquet(pipeline_root: str, cache_dir: str, recalc: bool) -> str:
@@ -101,6 +131,16 @@ def build_outinfo_parquets(resultdir: str, cache_dir: str) -> tuple[str, str]:
     return detect_cache, track_cache
 
 
+def build_rpi_info_parquet(pi_root: str, cache_dir: str, video_glob_pattern: str = "*.h264") -> str:
+    os.makedirs(cache_dir, exist_ok=True)
+    df = list_rpi_files_incremental(pi_root, cache_dir, video_glob_pattern=video_glob_pattern)
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    out_path = os.path.join(cache_dir, f"rpi_info_{today}.parquet")
+    df.to_parquet(out_path, index=False)
+    print(f"[rpi_info] wrote {len(df)} rows -> {out_path}")
+    return out_path
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Create/refresh BeesBook fileinfo caches.")
     p.add_argument(
@@ -111,9 +151,9 @@ def parse_args():
     )
     p.add_argument(
         "--what",
-        choices=["all", "bbb", "outputs"],
+        choices=["all", "bbb", "outputs", "rpi"],
         default="all",
-        help="Which caches to (re)build: all, only bbb catalog, or only outputs catalogs.",
+        help="Which caches to (re)build: all, only bbb catalog, only outputs catalogs, or only RPi catalog.",
     )
     # ✅ use-cache replaces recalc, inverted logic
     p.add_argument(
@@ -134,6 +174,8 @@ def main():
         print("ERROR: pipeline_root/resultdir not set in settings.", file=sys.stderr)
         sys.exit(2)
 
+    pi_root = _pick_pi_root(None if args.paths == "auto" else args.paths)
+
     cache_dir = os.path.join(resultdir, "bbb_fileinfo")
     os.makedirs(cache_dir, exist_ok=True)
 
@@ -142,6 +184,8 @@ def main():
     print(f"[config] cache_dir     = {cache_dir}")
     print(f"[config] mode          = {args.what}")
     print(f"[config] use_cache     = {args.use_cache}")
+    if args.what in ("all", "rpi"):
+        print(f"[config] pi_root      = {pi_root}")
 
     if args.what in ("all", "bbb"):
         # invert logic: recalc = not use_cache
@@ -149,6 +193,12 @@ def main():
 
     if args.what in ("all", "outputs"):
         build_outinfo_parquets(resultdir, cache_dir)
+
+    if args.what in ("all", "rpi"):
+        if not pi_root or not os.path.exists(pi_root):
+            print("ERROR: pi_videodir not set or does not exist; skipping RPi catalog.", file=sys.stderr)
+        else:
+            build_rpi_info_parquet(pi_root, cache_dir)
 
     print("✅ Done.")
 
