@@ -230,7 +230,8 @@ def job_for_save_detect_chunk(job_args_list):
                         bee_id = bb_id.as_ferwar()
                         # Calculate confidence (product of probabilities)
                         bit_probs = np.array(det.bit_probabilities)   
-                        bee_id_confidence = np.prod(np.abs(bee_id - 0.5) * 2.0)
+                        # this confidence calculation is the same as bb_tracking -> track_generator -> calculate_tracked_bee_id
+                        bee_id_confidence = np.prod(np.abs(bit_probs - 0.5) * 2.0)
                     else:
                         bee_id = None
                         bee_id_confidence = None

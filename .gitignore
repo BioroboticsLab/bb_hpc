@@ -2,3 +2,4 @@ settings.py
 settings.py
 .DS_Store
 building_docker/comb-background-build-and-run-steps.sh
+.DS_Store
