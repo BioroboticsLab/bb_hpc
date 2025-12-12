@@ -109,6 +109,24 @@ done
 exit $rc
 """
 
+    pod_spec = {
+        "restartPolicy": "Never",
+        "imagePullSecrets": [{"name": k["image_pull_secret"]}],
+        "containers": [{
+            "name": "detect",
+            "image": k["image"],
+            "command": ["bash", "-lc", bash],
+            "resources": k["resources"],
+            "env": env_list,
+            "volumeMounts": k["volume_mounts"],
+            "tty": True,
+            "stdin": True,
+        }],
+        "volumes": k["volumes"],
+    }
+    if k.get("affinity"):
+        pod_spec["affinity"] = k["affinity"]
+
     job = {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -133,21 +151,7 @@ exit $rc
                         "job-name": job_name,
                     }
                 },
-                "spec": {
-                    "restartPolicy": "Never",
-                    "imagePullSecrets": [{"name": k["image_pull_secret"]}],
-                    "containers": [{
-                        "name": "detect",
-                        "image": k["image"],
-                        "command": ["bash", "-lc", bash],
-                        "resources": k["resources"],
-                        "env": env_list,
-                        "volumeMounts": k["volume_mounts"],
-                        "tty": True,
-                        "stdin": True,
-                    }],
-                    "volumes": k["volumes"],
-                }
+                "spec": pod_spec
             }
         }
     }
