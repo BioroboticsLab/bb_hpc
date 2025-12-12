@@ -5,6 +5,7 @@ from datetime import datetime
 
 from bb_hpc import settings
 from bb_hpc.src.generate import generate_jobs_save_detect
+import re
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -118,6 +119,15 @@ exit $rc
         }
     }
 
+def _sanitize_job_name(name: str) -> str:
+    """
+    Convert arbitrary strings to a DNS-1123 compliant name for K8s metadata.name.
+    """
+    name = name.lower()
+    name = re.sub(r"[^a-z0-9-]+", "-", name)
+    name = re.sub(r"-{2,}", "-", name).strip("-")
+    return name or "job"
+
 def _map_job_paths_to_hpc(item: dict) -> dict:
     """
     Convert job dict paths to the pod-visible HPC roots.
@@ -169,7 +179,7 @@ def main():
         filelists.append(f)
 
     jobname = s.get("jobname", "save_detect")
-    full_job_name = f"{jobname}-{stamp}"
+    full_job_name = _sanitize_job_name(f"{jobname}-{stamp}")
     par = int(settings.k8s["job"].get("parallelism", 1))
 
     # Runner inside the pod
