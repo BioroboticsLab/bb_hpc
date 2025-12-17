@@ -26,6 +26,11 @@ def parse_args():
         action="store_true",
         help="Use fileinfo to skip already processed videos and speed up job generation."
     )
+    p.add_argument(
+        "--check-read-bbb",
+        action="store_true",
+        help="Read .bbb files to validate them (slower but skips zero/invalid outputs)."
+    )
     return p.parse_args()
 
 
@@ -65,6 +70,7 @@ def main():
             verbose=False,
             RESULTDIR=resultdir,
             use_fileinfo=bool(args.use_fileinfo),
+            check_read_bbb=bool(args.check_read_bbb),
         )
     )
 

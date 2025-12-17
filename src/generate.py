@@ -5,7 +5,7 @@ import fnmatch
 
 from bb_binary.parsing import parse_video_fname
 from bb_binary import Repository
-from bb_hpc.src.fileinfo import get_bbb_file_path, get_pending_videos
+from bb_hpc.src.fileinfo import get_bbb_file_path, get_pending_videos, is_bbb_file_valid_basicmatch
 
 #################################################################
 ##### DETECT 
@@ -21,6 +21,7 @@ def generate_jobs_detect(
     verbose=False,
     video_glob_pattern="cam-*--*Z.mp4",
     use_fileinfo=False,          # use RESULTDIR/bbb_fileinfo/*.parquet
+    check_read_bbb=False,        # if True, read .bbb files to verify validity
 ):
     """
     Yield shards of videos to run detection on.
@@ -51,6 +52,9 @@ def generate_jobs_detect(
         If True, use RESULTDIR/bbb_fileinfo/video_info_all.parquet to source raw
         videos and bbb_info_*.parquet to skip videos whose .bbb already exists.
         Otherwise, fall back to glob + os.path.exists().
+    check_read_bbb : bool
+        If True, verify .bbb files by reading them (slower). Requires fileinfo
+        catalogs with is_valid, or falls back to per-file disk checks.
 
     Yields
     ------
@@ -95,25 +99,34 @@ def generate_jobs_detect(
                 else:
                     latest = info_files[-1]
                     df = pd.read_parquet(latest)
+                    catalog_ok = True
+                    if check_read_bbb:
+                        if "is_valid" not in df.columns:
+                            catalog_ok = False
+                            if verbose:
+                                print("[fileinfo] missing is_valid; falling back to disk checks")
+                        else:
+                            df = df[df["is_valid"].fillna(False) == True]
                     # The canonical schema produced by list_bbb_files/build_bbb_info_parquet is:
                     #   file_name, full_path, starttime, endtime, modified_time
                     # We want repo-relative paths; derive them from full_path if they live under repo_output_path.
-                    existing_relpaths = set()
-                    if "full_path" in df.columns:
-                        for fp in df["full_path"].astype(str):
-                            # Only derive a relpath if the file is actually under repo_output_path
-                            # (this avoids ValueError for paths from other repositories).
-                            try:
-                                relp = os.path.relpath(fp, repo_output_path)
-                                # relpath() will happily create a path with ".." if fp is outside;
-                                # ensure it's a subpath by rejecting anything that starts with ".."
-                                if not relp.startswith(".."):
-                                    existing_relpaths.add(os.path.normpath(relp))
-                            except Exception:
-                                pass
-                    # Also keep a fallback set of file basenames in case relpath derivation fails
-                    if "file_name" in df.columns:
-                        existing_fnames = set(df["file_name"].astype(str).tolist())
+                    if catalog_ok:
+                        existing_relpaths = set()
+                        if "full_path" in df.columns:
+                            for fp in df["full_path"].astype(str):
+                                # Only derive a relpath if the file is actually under repo_output_path
+                                # (this avoids ValueError for paths from other repositories).
+                                try:
+                                    relp = os.path.relpath(fp, repo_output_path)
+                                    # relpath() will happily create a path with ".." if fp is outside;
+                                    # ensure it's a subpath by rejecting anything that starts with ".."
+                                    if not relp.startswith(".."):
+                                        existing_relpaths.add(os.path.normpath(relp))
+                                except Exception:
+                                    pass
+                        # Also keep a fallback set of file basenames in case relpath derivation fails
+                        if "file_name" in df.columns:
+                            existing_fnames = set(df["file_name"].astype(str).tolist())
 
                     if verbose:
                         print(f"[fileinfo] loaded {latest} rows={len(df)} "
@@ -189,7 +202,7 @@ def generate_jobs_detect(
         else:
             # Disk check fallback
             full_bbb = join(repo_output_path, rel)
-            if os.path.exists(full_bbb):
+            if is_bbb_file_valid_basicmatch(full_bbb, check_read_file=check_read_bbb):
                 if verbose:
                     print("already exists (disk):", rel)
                 continue

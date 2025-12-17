@@ -19,6 +19,8 @@ def parse_args():
                    help="Write filelists & Job spec, but do not kubectl apply.")
     p.add_argument("--use-fileinfo", action="store_true",
                    help="Use fileinfo to skip already processed videos and speed up job generation.")
+    p.add_argument("--check-read-bbb", action="store_true",
+                   help="Read .bbb files to validate them (slower but skips zero/invalid outputs).")
     return p.parse_args()
 
 
@@ -197,6 +199,7 @@ def main():
         verbose          = False,
         RESULTDIR        = result_local,
         use_fileinfo     = bool(args.use_fileinfo),
+        check_read_bbb   = bool(args.check_read_bbb),
     ))
     if not chunks:
         print("No work to submit.")

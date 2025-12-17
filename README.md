@@ -61,7 +61,9 @@ This updates all caches using paths from `settings.py`.
 
 ```
 --paths {auto, local, hpc}    # Which directory paths to use (default: auto)
---what  {all, bbb, outputs}   # Which caches to rebuild (default: all)
+--what  {all, bbb, outputs, rpi}  # Which caches to rebuild (default: all)
+--use-cache / --no-use-cache  # Use incremental BBB cache (default: use)
+--check-read-bbb              # Read .bbb files to validate (adds is_valid; slower)
 ```
 
 **Examples:**
@@ -72,6 +74,9 @@ python -m bb_hpc.get_fileinfo --paths hpc --what bbb
 
 # Update only outputs using local paths (quick refresh before new jobs)
 python -m bb_hpc.get_fileinfo --paths local --what outputs
+
+# Force a full re-scan and validate .bbb files
+python -m bb_hpc.get_fileinfo --what bbb --no-use-cache --check-read-bbb
 ```
 
 After FileInfo is updated, Save-Detect and Tracking will automatically skip already-processed windows.
@@ -125,6 +130,7 @@ python -m bb_hpc.running_docker.detect_rpi_submit --dates 20251001
 **Detect:**
 - `--gpus {auto,all,0,1,...}` — GPU selection
 - `--containers-per-gpu N` — Parallel containers per GPU
+- `--video-glob PATTERN` — Override video glob (default: `cam-*--*Z.mp4`)
 
 **Save-Detect:**
 - `--workers N` — Number of parallel containers
@@ -154,6 +160,17 @@ All Docker scripts support `--dry-run`.
 **Manual job execution:** To manually re-run jobs, use the generated files in the `jobs/` folder.
 
 **Multi-system workflows:** When working across local + HPC systems, ensure `settings.py` is synchronized and the same bb_hpc version is installed in both environments.
+
+**BBB validity checks:** Detect submitters accept `--use-fileinfo` and `--check-read-bbb` to avoid reprocessing videos with missing/invalid `.bbb` outputs (slower, but safer).
+
+**Cleanup invalid BBB files (by date):**
+```bash
+# Dry-run scan for a specific day
+python -m bb_hpc.scan_and_remove_invalid_bbb_files --dates 20160819 --dry-run
+
+# Remove unreadable .bbb files for one or more days
+python -m bb_hpc.scan_and_remove_invalid_bbb_files --dates 20160819 20160820
+```
 
 ---
 

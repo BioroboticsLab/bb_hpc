@@ -23,6 +23,8 @@ def parse_args():
                    help="How many containers to run per GPU (default 1).")
     p.add_argument("--use-fileinfo", action="store_true",
                    help="Use RESULTDIR/bbb_fileinfo/bbb_info_*.parquet to skip videos whose .bbb already exists.")
+    p.add_argument("--check-read-bbb", action="store_true",
+                   help="Read .bbb files to validate them (slower but skips zero/invalid outputs).")
     p.add_argument("--video-glob", default="cam-*--*Z.mp4", help="Video glob pattern, e.g. 'cam-*--*Z.mp4'")
     return p.parse_args()
 
@@ -154,6 +156,7 @@ def main():
         datestring        = args.dates,
         verbose           = False,
         use_fileinfo      = bool(args.use_fileinfo),
+        check_read_bbb    = bool(args.check_read_bbb),
         video_glob_pattern= args.video_glob
     ))
     if not chunks:
