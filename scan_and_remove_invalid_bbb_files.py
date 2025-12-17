@@ -5,6 +5,7 @@ Scan .bbb files for one or more dates and remove files that cannot be read.
 Example:
   python scan_and_remove_invalid_bbb_files.py --dates 20160819 20160820
   python scan_and_remove_invalid_bbb_files.py --dates 2016-08-19 --dry-run
+  python scan_and_remove_invalid_bbb_files.py --dates 20160819 --deep-check-bbb
 """
 
 import argparse
@@ -12,10 +13,9 @@ import os
 import shlex
 import subprocess
 import sys
-from typing import Iterable
 
 from bb_hpc import settings
-from bb_hpc.src.fileinfo import is_bbb_file_valid_basicmatch
+from bb_hpc.src.fileinfo import is_bbb_file_valid_basicmatch, is_bbb_file_valid_deep
 
 
 def _pick_pipeline_root(prefer: str | None = None) -> str:
@@ -58,11 +58,15 @@ def _find_bbb_files(day_dir: str) -> list[str]:
         return bbb_files
 
 
-def _scan_day(day_dir: str, dry_run: bool, verbose: bool) -> tuple[int, int, int]:
+def _scan_day(day_dir: str, dry_run: bool, verbose: bool, deep_check_bbb: bool) -> tuple[int, int, int]:
     files = _find_bbb_files(day_dir)
     invalid: list[str] = []
     for path in files:
-        if not is_bbb_file_valid_basicmatch(path, check_read_file=True):
+        if deep_check_bbb:
+            ok = is_bbb_file_valid_deep(path)
+        else:
+            ok = is_bbb_file_valid_basicmatch(path, check_read_file=True)
+        if not ok:
             invalid.append(path)
             if verbose:
                 print(f"[invalid] {path}")
@@ -87,6 +91,8 @@ def parse_args():
     p.add_argument("--pipeline-root", default="", help="Override pipeline_root from settings.")
     p.add_argument("--dry-run", action="store_true", help="Scan only; do not delete files.")
     p.add_argument("--verbose", action="store_true", help="Print each invalid path.")
+    p.add_argument("--deep-check-bbb", action="store_true",
+                   help="Read through all frames for each .bbb (slower, catches premature EOF).")
     return p.parse_args()
 
 
@@ -116,7 +122,7 @@ def main():
             print(f"[skip] missing day directory: {day_dir}")
             continue
         print(f"[scan] {day_dir}")
-        n_files, n_invalid, n_removed = _scan_day(day_dir, args.dry_run, args.verbose)
+        n_files, n_invalid, n_removed = _scan_day(day_dir, args.dry_run, args.verbose, args.deep_check_bbb)
         total_files += n_files
         total_invalid += n_invalid
         total_removed += n_removed

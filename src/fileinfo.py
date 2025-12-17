@@ -104,12 +104,21 @@ def _list_rpi_day(day_dir: Path, day_str: str, video_glob_pattern: str) -> pd.Da
     cols = ["date", "cam", "video_name", "full_path", "detections_clahe", "detections_noclahe"]
     return pd.DataFrame(rows, columns=cols)
 
-def list_bbb_files_incremental(pipeline_root: str, cache_dir: str, check_read_bbb: bool = False) -> pd.DataFrame:
+def list_bbb_files_incremental(
+    pipeline_root: str,
+    cache_dir: str,
+    check_read_bbb: bool = False,
+    deep_check_bbb: bool = False,
+) -> pd.DataFrame:
     """
     Cache daily catalogs under cache_dir/daily/bbb_YYYYMMDD.parquet.
     Only rescan days that are missing or whose *minute-div* directory mtime
     (YYYY/MM/DD/HH/<minute-div>) is newer than the cached parquet.
+    If deep_check_bbb is True, cached daily files must include valid_check="deep"
+    or they will be regenerated.
     """
+    if deep_check_bbb:
+        check_read_bbb = True
     daily_dir = Path(cache_dir) / "daily"
     daily_dir.mkdir(parents=True, exist_ok=True)
 
@@ -137,8 +146,14 @@ def list_bbb_files_incremental(pipeline_root: str, cache_dir: str, check_read_bb
                 if deep_mtime is None or pq_mtime >= deep_mtime:
                     try:
                         df_cached = pd.read_parquet(out_pq)
-                        if check_read_bbb and "is_valid" not in df_cached.columns:
-                            raise ValueError("cached file missing is_valid")
+                        if check_read_bbb:
+                            if "is_valid" not in df_cached.columns:
+                                raise ValueError("cached file missing is_valid")
+                            if deep_check_bbb:
+                                if "valid_check" not in df_cached.columns:
+                                    raise ValueError("cached file missing valid_check")
+                                if not (df_cached["valid_check"] == "deep").all():
+                                    raise ValueError("cached file has non-deep validity checks")
                         dfs.append(df_cached)
                         continue
                     except Exception:
@@ -148,7 +163,7 @@ def list_bbb_files_incremental(pipeline_root: str, cache_dir: str, check_read_bb
 
         # Rescan this day only
         print("...reindexing")
-        df_day = list_bbb_files(str(d), check_read_bbb=check_read_bbb)
+        df_day = list_bbb_files(str(d), check_read_bbb=check_read_bbb, deep_check_bbb=deep_check_bbb)
         try:
             df_day.to_parquet(out_pq, index=False)
         except Exception:
@@ -159,7 +174,7 @@ def list_bbb_files_incremental(pipeline_root: str, cache_dir: str, check_read_bb
         return pd.concat(dfs, ignore_index=True)
     cols = ["file_name", "full_path", "starttime", "endtime", "modified_time", "file_size"]
     if check_read_bbb:
-        cols.append("is_valid")
+        cols.extend(["is_valid", "valid_check"])
     return pd.DataFrame(columns=cols)
 
 def list_rpi_files_incremental(video_root: str, cache_dir: str, video_glob_pattern: str = "*.h264") -> pd.DataFrame:
@@ -208,14 +223,20 @@ def list_rpi_files_incremental(video_root: str, cache_dir: str, video_glob_patte
         return pd.concat(dfs, ignore_index=True)
     return pd.DataFrame(columns=["date", "cam", "video_name", "full_path", "detections_clahe", "detections_noclahe"])
 
-def list_bbb_files(pipeline_root: str, check_read_bbb: bool = False) -> pd.DataFrame:
+def list_bbb_files(
+    pipeline_root: str,
+    check_read_bbb: bool = False,
+    deep_check_bbb: bool = False,
+) -> pd.DataFrame:
     """
     Fast scanner for .bbb files using GNU find, dramatically reducing metadata round-trips.
     Falls back to a scandir-based walk if GNU find is unavailable.
     Returns a DataFrame with columns:
       ['file_name','full_path','starttime','endtime','modified_time','file_size']
-      plus optional 'is_valid' when check_read_bbb=True.
+      plus optional 'is_valid' and 'valid_check' when check_read_bbb=True.
     """
+    if deep_check_bbb:
+        check_read_bbb = True
     def _from_find(root: str) -> pd.DataFrame:
         # %P  = path relative to the starting point
         # %T@ = mtime as seconds since epoch (float)
@@ -248,10 +269,15 @@ def list_bbb_files(pipeline_root: str, check_read_bbb: bool = False) -> pd.DataF
                     "file_size": file_size,
                 }
                 if check_read_bbb:
-                    if file_size == 0:
-                        row["is_valid"] = False
+                    if deep_check_bbb:
+                        row["is_valid"] = is_bbb_file_valid_deep(full)
+                        row["valid_check"] = "deep"
                     else:
-                        row["is_valid"] = is_bbb_file_valid_basicmatch(full, check_read_file=True)
+                        if file_size == 0:
+                            row["is_valid"] = False
+                        else:
+                            row["is_valid"] = is_bbb_file_valid_basicmatch(full, check_read_file=True)
+                        row["valid_check"] = "read"
                 append(row)
             except Exception:
                 # Skip any malformed lines/filenames rather than stalling the run
@@ -287,10 +313,15 @@ def list_bbb_files(pipeline_root: str, check_read_bbb: bool = False) -> pd.DataF
                                     "file_size": file_size,
                                 }
                                 if check_read_bbb:
-                                    if file_size == 0:
-                                        row["is_valid"] = False
+                                    if deep_check_bbb:
+                                        row["is_valid"] = is_bbb_file_valid_deep(full)
+                                        row["valid_check"] = "deep"
                                     else:
-                                        row["is_valid"] = is_bbb_file_valid_basicmatch(full, check_read_file=True)
+                                        if file_size == 0:
+                                            row["is_valid"] = False
+                                        else:
+                                            row["is_valid"] = is_bbb_file_valid_basicmatch(full, check_read_file=True)
+                                        row["valid_check"] = "read"
                                 append(row)
                             except Exception:
                                 continue
@@ -443,3 +474,49 @@ def is_bbb_file_valid_basicmatch(bbb_file, check_read_file = False):
                 return True  # File is valid
             except Exception:
                 return False  # File is invalid or cannot be read
+
+def is_bbb_file_valid_deep(bbb_file):
+    """
+    Deep validation: attempt to read all FrameContainers until EOF.
+    Returns False on premature EOF / decode errors.
+    """
+    if not os.path.exists(bbb_file):
+        return False
+    try:
+        size = os.path.getsize(bbb_file)
+        if size == 0:
+            return False
+    except Exception:
+        size = None
+
+    try:
+        with open(bbb_file, "rb") as f:
+            while True:
+                pos = f.tell()
+                if size is not None:
+                    if pos == size:
+                        return True
+                    if size - pos < 8:
+                        return False
+                try:
+                    bbb.FrameContainer.read(f)
+                    if f.tell() <= pos:
+                        return False
+                except EOFError:
+                    if size is not None:
+                        try:
+                            if f.tell() < size:
+                                return False
+                        except Exception:
+                            pass
+                    return True
+                except Exception:
+                    if size is not None:
+                        try:
+                            if f.tell() >= size:
+                                return True
+                        except Exception:
+                            pass
+                    return False
+    except Exception:
+        return False

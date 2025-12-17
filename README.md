@@ -64,6 +64,7 @@ This updates all caches using paths from `settings.py`.
 --what  {all, bbb, outputs, rpi}  # Which caches to rebuild (default: all)
 --use-cache / --no-use-cache  # Use incremental BBB cache (default: use)
 --check-read-bbb              # Read .bbb files to validate (adds is_valid; slower)
+--deep-check-bbb              # Read all frames for each .bbb (slowest; catches premature EOF)
 ```
 
 **Examples:**
@@ -77,6 +78,9 @@ python -m bb_hpc.get_fileinfo --paths local --what outputs
 
 # Force a full re-scan and validate .bbb files
 python -m bb_hpc.get_fileinfo --what bbb --no-use-cache --check-read-bbb
+
+# Deep validation (scan all frames)
+python -m bb_hpc.get_fileinfo --what bbb --no-use-cache --deep-check-bbb
 ```
 
 After FileInfo is updated, Save-Detect and Tracking will automatically skip already-processed windows.
@@ -170,6 +174,9 @@ python -m bb_hpc.scan_and_remove_invalid_bbb_files --dates 20160819 --dry-run
 
 # Remove unreadable .bbb files for one or more days
 python -m bb_hpc.scan_and_remove_invalid_bbb_files --dates 20160819 20160820
+
+# Deep scan (reads through all frames)
+python -m bb_hpc.scan_and_remove_invalid_bbb_files --dates 20160819 --deep-check-bbb
 ```
 
 ---

@@ -94,12 +94,27 @@ def _pick_pi_root(prefer: str | None = None) -> str:
     return pi_local or pi_hpc
 
 
-def build_bbb_info_parquet(pipeline_root: str, cache_dir: str, recalc: bool, check_read_bbb: bool = False) -> str:
+def build_bbb_info_parquet(
+    pipeline_root: str,
+    cache_dir: str,
+    recalc: bool,
+    check_read_bbb: bool = False,
+    deep_check_bbb: bool = False,
+) -> str:
     os.makedirs(cache_dir, exist_ok=True)
     if recalc:
-        df = list_bbb_files(pipeline_root, check_read_bbb=check_read_bbb)
+        df = list_bbb_files(
+            pipeline_root,
+            check_read_bbb=check_read_bbb,
+            deep_check_bbb=deep_check_bbb,
+        )
     else:
-        df = list_bbb_files_incremental(pipeline_root, cache_dir, check_read_bbb=check_read_bbb)
+        df = list_bbb_files_incremental(
+            pipeline_root,
+            cache_dir,
+            check_read_bbb=check_read_bbb,
+            deep_check_bbb=deep_check_bbb,
+        )
     today = datetime.now(timezone.utc).strftime("%Y%m%d")
     out_path = os.path.join(cache_dir, f"bbb_info_{today}.parquet")
     df.to_parquet(out_path, index=False)
@@ -168,6 +183,11 @@ def parse_args():
         action="store_true",
         help="Attempt to read each .bbb to validate it (adds is_valid column; slower).",
     )
+    p.add_argument(
+        "--deep-check-bbb",
+        action="store_true",
+        help="Read through all frames for each .bbb (slower, catches premature EOF).",
+    )
     return p.parse_args()
 
 
@@ -190,6 +210,7 @@ def main():
     print(f"[config] mode          = {args.what}")
     print(f"[config] use_cache     = {args.use_cache}")
     print(f"[config] check_read   = {args.check_read_bbb}")
+    print(f"[config] deep_check  = {args.deep_check_bbb}")
     if args.what in ("all", "rpi"):
         print(f"[config] pi_root      = {pi_root}")
 
@@ -199,7 +220,8 @@ def main():
             pipeline_root,
             cache_dir,
             recalc=not args.use_cache,
-            check_read_bbb=args.check_read_bbb,
+            check_read_bbb=args.check_read_bbb or args.deep_check_bbb,
+            deep_check_bbb=args.deep_check_bbb,
         )
 
     if args.what in ("all", "outputs"):
