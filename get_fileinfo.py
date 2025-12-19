@@ -6,7 +6,7 @@ Generate/refresh fileinfo caches for BeesBook:
      - catalog of all .bbb files in the repository (time windows + mtime)
 
   2) <RESULTDIR>/bbb_fileinfo/save_detect_outinfo.parquet
-     - catalog of existing daily save-detect outputs (.parquet)
+     - catalog of existing save-detect outputs (.parquet)
 
   3) <RESULTDIR>/bbb_fileinfo/save_tracking_outinfo.parquet
      - catalog of existing tracking outputs (.dill)

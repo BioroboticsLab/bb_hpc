@@ -248,9 +248,11 @@ def generate_jobs_save_detect(
     datestring,                 # e.g. ["20250901","20250902", ...]
     chunk_size=50,
     maxjobs=None,
+    interval_hours: int = 1,
 ):
     """
-    Generate daily save-detect jobs per camera for the given YYYYMMDD dates.
+    Generate save-detect jobs per camera over fixed hourly windows inside the
+    given YYYYMMDD dates (default: 1-hour windows).
     Uses fileinfo parquet(s) to see what's in the repo and compares against
     previously saved outputs to avoid redoing work.
 
@@ -301,6 +303,18 @@ def generate_jobs_save_detect(
         dt0 = datetime.strptime(dstr, "%Y%m%d").replace(tzinfo=timezone.utc)
         return dt0, dt0 + timedelta(days=1)
 
+    # Hourly (or configurable) windows within a day
+    interval = timedelta(hours=int(interval_hours))
+    if interval.total_seconds() <= 0:
+        raise ValueError("interval_hours must be positive")
+
+    def _iter_windows(day_start, day_end):
+        t = day_start
+        while t < day_end:
+            nxt = min(t + interval, day_end)
+            yield t, nxt
+            t = nxt
+
     # Collect candidates (per-date, per-cam) where:
     # - there is at least one repo file overlapping that day for that cam
     # - output either missing or older than latest source
@@ -313,17 +327,23 @@ def generate_jobs_save_detect(
             continue
 
         for cam_id, subset in sel.groupby('cam_id'):
-            latest_src = subset['modified_time'].max()
-            key = (cam_id, day_start, day_end)
-            existing = out_index.get(key)
-            if (existing is None) or (latest_src > existing):
-                candidates.append({
-                    'repo_path': PIPELINE_ROOT,
-                    'save_path': save_dir,
-                    'from_dt':   day_start,
-                    'to_dt':     day_end,
-                    'cam_id':    cam_id,
-                })
+            for win_start, win_end in _iter_windows(day_start, day_end):
+                # Only schedule windows that overlap at least one repo file
+                window_data = subset[(subset['starttime'] < win_end) & (subset['endtime'] > win_start)]
+                if window_data.empty:
+                    continue
+
+                latest_src = window_data['modified_time'].max()
+                key = (cam_id, win_start, win_end)
+                existing = out_index.get(key)
+                if (existing is None) or (latest_src > existing):
+                    candidates.append({
+                        'repo_path': PIPELINE_ROOT,
+                        'save_path': save_dir,
+                        'from_dt':   win_start,
+                        'to_dt':     win_end,
+                        'cam_id':    cam_id,
+                    })
 
     # Sort date-ordered (by from_dt) then cam_id
     candidates.sort(key=lambda x: (x['from_dt'], x['cam_id']), reverse=False)
@@ -335,7 +355,7 @@ def generate_jobs_save_detect(
 
     # Emit in chunks
     print(f"[save_detect] dates={len(datestring)} candidates={len(candidates)} "
-          f"chunk_size={chunk_size} maxjobs={maxjobs}")
+          f"chunk_size={chunk_size} maxjobs={maxjobs} interval_hours={interval_hours}")
     for i in range(0, len(candidates), int(chunk_size)):
         yield {"job_args_list": candidates[i:i+int(chunk_size)]}
 
