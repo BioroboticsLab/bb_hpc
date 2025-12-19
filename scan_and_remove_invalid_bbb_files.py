@@ -58,7 +58,7 @@ def _find_bbb_files(day_dir: str) -> list[str]:
         return bbb_files
 
 
-def _scan_day(day_dir: str, dry_run: bool, verbose: bool, deep_check_bbb: bool) -> tuple[int, int, int]:
+def _scan_day(day_dir: str, dry_run: bool, verbose: bool, deep_check_bbb: bool) -> tuple[int, int, int, list[str]]:
     files = _find_bbb_files(day_dir)
     invalid: list[str] = []
     for path in files:
@@ -80,7 +80,7 @@ def _scan_day(day_dir: str, dry_run: bool, verbose: bool, deep_check_bbb: bool) 
             except Exception as e:
                 print(f"[warn] failed to remove {path}: {e}")
 
-    return len(files), len(invalid), removed
+    return len(files), len(invalid), removed, invalid
 
 
 def parse_args():
@@ -122,12 +122,16 @@ def main():
             print(f"[skip] missing day directory: {day_dir}")
             continue
         print(f"[scan] {day_dir}")
-        n_files, n_invalid, n_removed = _scan_day(day_dir, args.dry_run, args.verbose, args.deep_check_bbb)
+        n_files, n_invalid, n_removed, invalid_paths = _scan_day(day_dir, args.dry_run, args.verbose, args.deep_check_bbb)
         total_files += n_files
         total_invalid += n_invalid
         total_removed += n_removed
         if args.dry_run:
             print(f"[day] files={n_files} invalid={n_invalid} (dry-run)")
+            if invalid_paths:
+                print("[invalid paths]")
+                for p in invalid_paths:
+                    print(p)
         else:
             print(f"[day] files={n_files} invalid={n_invalid} removed={n_removed}")
 
