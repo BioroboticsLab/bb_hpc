@@ -259,12 +259,7 @@ def job_for_save_detect_chunk(job_args_list):
             Returns:
             - df_untagged: pandas DataFrame in the required format
             """
-    
-            # Swap x_pixels and y_pixels 
-            detections_df[['x_pixels', 'y_pixels']] = detections_df[['y_pixels', 'x_pixels']]
-                    # define orientation_hive to reflect the rotation
-            detections_df['orientation_pixels'] = detections_df['orientation_pixels'] + np.pi/2
-    
+        
             # Ensure that data types are consistent
             columns_to_numeric = ['cam_id', 'detection_type', 'x_pixels', 'y_pixels', 'orientation_pixels', 'localizer_saliency', 'bee_id', 'bee_id_confidence']        
             
