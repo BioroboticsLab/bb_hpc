@@ -475,10 +475,14 @@ def is_bbb_file_valid_basicmatch(bbb_file, check_read_file = False):
             except Exception:
                 return False  # File is invalid or cannot be read
 
+
 def is_bbb_file_valid_deep(bbb_file):
     """
     Deep validation: attempt to read all FrameContainers until EOF.
     Returns False on premature EOF / decode errors.
+
+    This runs the validation in a subprocess to handle Cap'n Proto C++ exceptions
+    that would otherwise crash the main process (e.g., "Premature EOF" from kj library).
     """
     if not os.path.exists(bbb_file):
         return False
@@ -487,36 +491,55 @@ def is_bbb_file_valid_deep(bbb_file):
         if size == 0:
             return False
     except Exception:
-        size = None
+        pass
 
-    try:
-        with open(bbb_file, "rb") as f:
-            while True:
-                pos = f.tell()
+    # Run validation in subprocess to isolate from Cap'n Proto C++ crashes
+    script = f'''
+import sys
+import os
+import bb_binary
+bbb = bb_binary.common.bbb
+
+bbb_file = {bbb_file!r}
+try:
+    size = os.path.getsize(bbb_file)
+except Exception:
+    size = None
+
+try:
+    with open(bbb_file, "rb") as f:
+        while True:
+            pos = f.tell()
+            if size is not None:
+                if pos == size:
+                    sys.exit(0)  # valid
+                if size - pos < 8:
+                    sys.exit(1)  # invalid
+            try:
+                bbb.FrameContainer.read(f)
+                if f.tell() <= pos:
+                    sys.exit(1)  # invalid
+            except EOFError:
                 if size is not None:
-                    if pos == size:
-                        return True
-                    if size - pos < 8:
-                        return False
-                try:
-                    bbb.FrameContainer.read(f)
-                    if f.tell() <= pos:
-                        return False
-                except EOFError:
-                    if size is not None:
-                        try:
-                            if f.tell() < size:
-                                return False
-                        except Exception:
-                            pass
-                    return True
-                except Exception:
-                    if size is not None:
-                        try:
-                            if f.tell() >= size:
-                                return True
-                        except Exception:
-                            pass
-                    return False
+                    if f.tell() < size:
+                        sys.exit(1)  # invalid
+                sys.exit(0)  # valid
+            except Exception:
+                if size is not None:
+                    if f.tell() >= size:
+                        sys.exit(0)  # valid
+                sys.exit(1)  # invalid
+except Exception:
+    sys.exit(1)  # invalid
+'''
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            timeout=60,
+            capture_output=True,
+        )
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
     except Exception:
         return False
