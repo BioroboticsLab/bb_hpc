@@ -6,6 +6,7 @@ Example:
   python scan_and_remove_invalid_bbb_files.py --dates 20160819 20160820
   python scan_and_remove_invalid_bbb_files.py --dates 2016-08-19 --dry-run
   python scan_and_remove_invalid_bbb_files.py --dates 20160819 --deep-check-bbb
+  python scan_and_remove_invalid_bbb_files.py --dates 20160819 --deep-check-bbb --num-workers 16
 """
 
 import argparse
@@ -13,6 +14,7 @@ import os
 import shlex
 import subprocess
 import sys
+from multiprocessing import Pool
 
 from bb_hpc import settings
 from bb_hpc.src.fileinfo import is_bbb_file_valid_basicmatch, is_bbb_file_valid_deep
@@ -58,18 +60,46 @@ def _find_bbb_files(day_dir: str) -> list[str]:
         return bbb_files
 
 
-def _scan_day(day_dir: str, dry_run: bool, verbose: bool, deep_check_bbb: bool) -> tuple[int, int, int, list[str]]:
+def _validate_file(args: tuple[str, bool]) -> tuple[str, bool]:
+    """Worker function for parallel validation. Returns (path, is_valid)."""
+    path, deep_check = args
+    if deep_check:
+        ok = is_bbb_file_valid_deep(path)
+    else:
+        ok = is_bbb_file_valid_basicmatch(path, check_read_file=True)
+    return path, ok
+
+
+def _scan_day(
+    day_dir: str,
+    dry_run: bool,
+    verbose: bool,
+    deep_check_bbb: bool,
+    num_workers: int = 1,
+) -> tuple[int, int, int, list[str]]:
     files = _find_bbb_files(day_dir)
     invalid: list[str] = []
-    for path in files:
-        if deep_check_bbb:
-            ok = is_bbb_file_valid_deep(path)
-        else:
-            ok = is_bbb_file_valid_basicmatch(path, check_read_file=True)
-        if not ok:
-            invalid.append(path)
-            if verbose:
-                print(f"[invalid] {path}")
+
+    if num_workers > 1 and len(files) > 1:
+        # Parallel validation
+        work_items = [(path, deep_check_bbb) for path in files]
+        with Pool(processes=num_workers) as pool:
+            for path, ok in pool.imap_unordered(_validate_file, work_items, chunksize=10):
+                if not ok:
+                    invalid.append(path)
+                    if verbose:
+                        print(f"[invalid] {path}")
+    else:
+        # Sequential validation
+        for path in files:
+            if deep_check_bbb:
+                ok = is_bbb_file_valid_deep(path)
+            else:
+                ok = is_bbb_file_valid_basicmatch(path, check_read_file=True)
+            if not ok:
+                invalid.append(path)
+                if verbose:
+                    print(f"[invalid] {path}")
 
     removed = 0
     if not dry_run:
@@ -93,6 +123,8 @@ def parse_args():
     p.add_argument("--verbose", action="store_true", help="Print each invalid path.")
     p.add_argument("--deep-check-bbb", action="store_true",
                    help="Read through all frames for each .bbb (slower, catches premature EOF).")
+    p.add_argument("--num-workers", type=int, default=8,
+                   help="Number of parallel workers for validation (default: 8, use 1 for sequential).")
     return p.parse_args()
 
 
@@ -122,7 +154,9 @@ def main():
             print(f"[skip] missing day directory: {day_dir}")
             continue
         print(f"[scan] {day_dir}")
-        n_files, n_invalid, n_removed, invalid_paths = _scan_day(day_dir, args.dry_run, args.verbose, args.deep_check_bbb)
+        n_files, n_invalid, n_removed, invalid_paths = _scan_day(
+            day_dir, args.dry_run, args.verbose, args.deep_check_bbb, args.num_workers
+        )
         total_files += n_files
         total_invalid += n_invalid
         total_removed += n_removed
