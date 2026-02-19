@@ -452,7 +452,7 @@ def job_for_tracking(repo_path, save_path, temp_path, from_dt, to_dt, cam_id):
                                                                       cam_ids=(cam_id,),
                                                                       tracklet_kwargs=detection_kwargs,
                                                                       track_kwargs=tracklet_kwargs,
-                                                                      repo_kwargs=dict(only_tagged_bees=True, fix_negative_timestamps=False),
+                                                                      repo_kwargs=dict(only_tagged_bees=True, fix_negative_timestamps=True),
                                                                       progress_bar=None, use_threading=False)
      
     # open the output file and write as results are generated
