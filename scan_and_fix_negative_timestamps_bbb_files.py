@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-Scan .bbb files for negative timestamp jumps (intra-container and inter-container)
-and remove offending files.
+Scan .bbb files for negative timestamp jumps and cross-boundary duplicate copies,
+then remove only the offending files.
 
 Detects three kinds of problems:
   1. Intra-container: frames within a single .bbb have backward timestamps (NTP glitch).
   2. Inter-container overlap: a container's first timestamp < the previous container's
-     last timestamp for the same camera.
-  3. Duplicates: two .bbb files with identical (cam_id, fromTimestamp, toTimestamp),
-     typically real copies instead of symlinks in legacy repos.
+     last timestamp for the same camera (non-duplicate overlap).
+  3. Cross-boundary duplicates: same .bbb file exists as a real copy in two 20-minute
+     bucket directories (created by check_symlinks_and_fill_in.py when symlinks aren't
+     supported). These cause iter_fnames to yield the same data twice, crashing the tracker.
+
+For duplicates: keeps the canonical copy (in the bucket matching fromTimestamp) and
+removes the secondary copy. This is safe because tracking iterates full hour chunks.
 
 Example:
   python scan_and_fix_negative_timestamps_bbb_files.py --dates 20160801 20160803
@@ -72,6 +76,19 @@ def _find_bbb_files(day_dir: str) -> list[str]:
         return bbb_files
 
 
+def _canonical_bucket_dir(from_ts: float, pipeline_root: str, minute_step: int = 20) -> str:
+    """Compute the canonical directory bucket for a .bbb file based on its fromTimestamp.
+
+    This mirrors bb_binary.Repository._path_for_dt: YYYY/MM/DD/HH/MM where MM is
+    floored to the nearest minute_step.
+    """
+    from datetime import datetime, timezone
+    dt = datetime.fromtimestamp(from_ts, tz=timezone.utc)
+    minutes = int(math.floor(dt.minute / minute_step) * minute_step)
+    rel = f"{dt.year:04d}/{dt.month:02d}/{dt.day:02d}/{dt.hour:02d}/{minutes:02d}"
+    return os.path.join(pipeline_root, rel)
+
+
 # ---------------------------------------------------------------------------
 # Timestamp checking
 # ---------------------------------------------------------------------------
@@ -111,47 +128,21 @@ def _check_one_file(path: str) -> dict | None:
     )
 
 
-def _find_dangling_symlinks(removed_path: str) -> list[str]:
-    """Find symlinks in adjacent 20-minute bucket directories that point to the
-    removed file (by matching the filename)."""
-    removed = Path(removed_path)
-    fname = removed.name
-    bucket_dir = removed.parent  # .../HH/MM
-
-    dangling = []
-    try:
-        hour_dir = bucket_dir.parent  # .../HH
-        for sibling in hour_dir.iterdir():
-            if not sibling.is_dir():
-                continue
-            candidate = sibling / fname
-            if candidate != removed and candidate.is_symlink():
-                # Check if the symlink target matches the removed file
-                try:
-                    target = candidate.resolve()
-                    if target == removed.resolve() or not target.exists():
-                        dangling.append(str(candidate))
-                except Exception:
-                    dangling.append(str(candidate))
-    except Exception:
-        pass
-    return dangling
-
-
 def _scan_day(
     day_dir: str,
+    pipeline_root: str,
     dry_run: bool,
     verbose: bool,
     num_workers: int = 1,
-) -> tuple[int, int, int, list[tuple[str, str]]]:
+) -> tuple[int, int, int, int, list[tuple[str, str]]]:
     """Scan a single day directory for timestamp problems.
 
-    Returns (n_files, n_flagged, n_removed, flagged_list)
+    Returns (n_files, n_dupes_flagged, n_bad_flagged, n_removed, flagged_list)
     where flagged_list is [(path, reason), ...].
     """
     files = _find_bbb_files(day_dir)
     if not files:
-        return 0, 0, 0, []
+        return 0, 0, 0, 0, []
 
     # Step 1: read all .bbb files (parallel)
     if num_workers > 1 and len(files) > 1:
@@ -163,48 +154,83 @@ def _scan_day(
     # Filter out unreadable files
     infos = [r for r in results if r is not None]
 
-    # Step 2: group by camera, sort by from_ts
+    # Step 2: group by (cam_id, filename) to find duplicates across directories
+    # Same filename in different bucket dirs = cross-boundary duplicate
+    by_name: dict[tuple[int, str], list[dict]] = defaultdict(list)
+    for info in infos:
+        fname = os.path.basename(info["path"])
+        by_name[(info["cam_id"], fname)].append(info)
+
+    flagged: list[tuple[str, str]] = []  # (path, reason)
+    dupes_flagged = 0
+    bad_flagged = 0
+
+    # Step 3a: handle duplicates — keep canonical, flag secondary
+    canonical_paths: set[str] = set()  # paths we're keeping
+    removed_paths: set[str] = set()    # paths flagged for removal
+
+    for (cam_id, fname), copies in by_name.items():
+        if len(copies) <= 1:
+            canonical_paths.add(copies[0]["path"])
+            continue
+
+        # Determine canonical copy: the one in the bucket matching fromTimestamp
+        canonical_dir = _canonical_bucket_dir(copies[0]["from_ts"], pipeline_root)
+        canonical = None
+        secondaries = []
+        for c in copies:
+            parent = os.path.dirname(c["path"])
+            if os.path.normpath(parent) == os.path.normpath(canonical_dir):
+                canonical = c
+            else:
+                secondaries.append(c)
+
+        # If no copy is in the canonical dir, keep the first one
+        if canonical is None:
+            canonical = copies[0]
+            secondaries = copies[1:]
+
+        canonical_paths.add(canonical["path"])
+        for sec in secondaries:
+            reason = f"secondary duplicate (canonical in {os.path.basename(os.path.dirname(canonical['path']))}/ bucket)"
+            flagged.append((sec["path"], reason))
+            removed_paths.add(sec["path"])
+            dupes_flagged += 1
+            if verbose:
+                print(f"  [dupe] cam={cam_id} {os.path.basename(os.path.dirname(sec['path']))}/{fname}")
+
+    # Step 3b: among remaining (canonical) files, check for ordering issues
     by_cam: dict[int, list[dict]] = defaultdict(list)
     for info in infos:
+        if info["path"] in removed_paths:
+            continue
         by_cam[info["cam_id"]].append(info)
     for cam_id in by_cam:
         by_cam[cam_id].sort(key=lambda x: x["from_ts"])
 
-    # Step 3: detect problems
-    flagged: list[tuple[str, str]] = []  # (path, reason)
-    flagged_paths: set[str] = set()
-
     for cam_id, cam_infos in sorted(by_cam.items()):
-        seen_keys: dict[tuple, str] = {}  # (from_ts, to_ts) -> first path
         last_end_ts: float | None = None
 
         for info in cam_infos:
             path = info["path"]
             reasons = []
 
-            # Check 1: intra-container negative timestamps
+            # Check: intra-container negative timestamps
             if info["has_intra_negative"]:
                 reasons.append("intra-container negative timestamp jump")
 
-            # Check 2: duplicate detection
-            key = (info["from_ts"], info["to_ts"])
-            if key in seen_keys:
-                reasons.append(f"duplicate of {os.path.basename(seen_keys[key])}")
-            else:
-                seen_keys[key] = path
-
-            # Check 3: inter-container overlap
+            # Check: inter-container overlap (after removing duplicates)
             if last_end_ts is not None and info["first_frame_ts"] < last_end_ts:
                 gap = info["first_frame_ts"] - last_end_ts
                 reasons.append(f"inter-container overlap ({gap:.1f}s)")
 
             if reasons:
                 flagged.append((path, "; ".join(reasons)))
-                flagged_paths.add(path)
+                removed_paths.add(path)
+                bad_flagged += 1
                 if verbose:
-                    print(f"  [flagged] cam={cam_id} {os.path.basename(path)}: {'; '.join(reasons)}")
+                    print(f"  [bad] cam={cam_id} {os.path.basename(path)}: {'; '.join(reasons)}")
             else:
-                # Only advance last_end_ts for non-flagged files
                 last_end_ts = info["last_frame_ts"]
 
     # Step 4: remove flagged files (unless dry-run)
@@ -214,18 +240,10 @@ def _scan_day(
             try:
                 os.remove(path)
                 removed += 1
-                # Also clean up dangling symlinks
-                for sym in _find_dangling_symlinks(path):
-                    try:
-                        os.remove(sym)
-                        if verbose:
-                            print(f"  [removed symlink] {sym}")
-                    except Exception as e:
-                        print(f"  [warn] failed to remove symlink {sym}: {e}")
             except Exception as e:
                 print(f"  [warn] failed to remove {path}: {e}")
 
-    return len(files), len(flagged), removed, flagged
+    return len(files), dupes_flagged, bad_flagged, removed, flagged
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +252,8 @@ def _scan_day(
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Scan .bbb files for negative timestamp jumps and remove offending files."
+        description="Scan .bbb files for negative timestamp jumps and cross-boundary "
+                    "duplicates, then remove offending files."
     )
     p.add_argument("--dates", nargs="+", required=True,
                    help="Dates to scan (YYYYMMDD or YYYY-MM-DD).")
@@ -270,7 +289,8 @@ def main():
             sys.exit(2)
 
     total_files = 0
-    total_flagged = 0
+    total_dupes = 0
+    total_bad = 0
     total_removed = 0
 
     for d in dates:
@@ -279,24 +299,26 @@ def main():
             print(f"[skip] missing day directory: {day_dir}")
             continue
         print(f"[scan] {day_dir}")
-        n_files, n_flagged, n_removed, flagged_list = _scan_day(
-            day_dir, args.dry_run, args.verbose, args.num_workers
+        n_files, n_dupes, n_bad, n_removed, flagged_list = _scan_day(
+            day_dir, pipeline_root, args.dry_run, args.verbose, args.num_workers
         )
         total_files += n_files
-        total_flagged += n_flagged
+        total_dupes += n_dupes
+        total_bad += n_bad
         total_removed += n_removed
         if args.dry_run:
-            print(f"[day] files={n_files} flagged={n_flagged} (dry-run)")
+            print(f"[day] files={n_files} secondary_dupes={n_dupes} bad={n_bad} (dry-run)")
             if flagged_list and not args.verbose:
                 for path, reason in flagged_list:
                     print(f"  {path}: {reason}")
         else:
-            print(f"[day] files={n_files} flagged={n_flagged} removed={n_removed}")
+            print(f"[day] files={n_files} secondary_dupes={n_dupes} bad={n_bad} removed={n_removed}")
 
+    print()
     if args.dry_run:
-        print(f"\n[total] files={total_files} flagged={total_flagged} (dry-run)")
+        print(f"[total] files={total_files} secondary_dupes={total_dupes} bad={total_bad} (dry-run)")
     else:
-        print(f"\n[total] files={total_files} flagged={total_flagged} removed={total_removed}")
+        print(f"[total] files={total_files} secondary_dupes={total_dupes} bad={total_bad} removed={total_removed}")
 
 
 if __name__ == "__main__":
