@@ -497,6 +497,23 @@ def generate_jobs_tracking(
 #################################################################
 ##### RPI - DETECT
 #################################################################
+def _resolve_model_type(cam_id, cam_model_rules):
+    """Return model type string for a cam_id using prefix matching (first match wins)."""
+    for prefix, model_type in cam_model_rules.items():
+        if cam_id.startswith(prefix):
+            return model_type
+    return "default"
+
+
+def _parse_rpi_timestamp(basename):
+    """Parse timestamp from RPi video basename; fallback to None."""
+    try:
+        ts_str = os.path.splitext(basename)[0].rsplit("_", 1)[-1]
+        return datetime.strptime(ts_str, "%Y-%m-%d-%H-%M-%S")
+    except Exception:
+        return None
+
+
 def generate_jobs_rpi_detect(
     video_root_dir,
     dates,
@@ -504,14 +521,20 @@ def generate_jobs_rpi_detect(
     maxjobs=None,
     video_glob_pattern="*.h264",
     clahe=True,
+    cam_model_rules=None,
 ):
     """
     Yields shards of RPi video paths under date directories using fast globbing.
-    Excludes videos already processed (suffix depends on CLAHE).
-    - Newest videos first (sorted by timestamp parsed from filename like ..._YYYY-MM-DD-HH-MM-SS.h264).
+    Excludes videos already processed (suffix depends on CLAHE and model type).
+
+    When cam_model_rules is provided, videos are partitioned by model type so each
+    shard contains only one type.  Each yielded dict includes a "model_type" key.
+
+    - Oldest videos first (sorted by timestamp parsed from filename).
     - If parsing fails, falls back to file mtime.
-    - If maxjobs is set, only keeps the newest chunk_size * maxjobs videos.
+    - If maxjobs is set, only keeps chunk_size * maxjobs videos per model type.
     """
+    from collections import defaultdict
 
     # 1) glob all raw h264’s for requested dates
     print("getting new h264 files")
@@ -522,49 +545,53 @@ def generate_jobs_rpi_detect(
         all_videos.extend(glob.glob(pattern, recursive=True))
     print("found", len(all_videos), "files")
 
-    # 2) filter out videos already processed (suffix depends on CLAHE)
+    # 2) partition by model type and filter already-processed
     print("making list to submit")
-    suffix = "-c" if clahe else "-nc"
-    to_schedule = []
+    clahe_suffix = "-c" if clahe else "-nc"
+    by_model = defaultdict(list)
+
     for v in all_videos:
-        det_file = os.path.splitext(v)[0] + f"-detections{suffix}.parquet"
+        basename = os.path.basename(v)
+        cam_id = basename.split("_")[0]
+        model_type = _resolve_model_type(cam_id, cam_model_rules) if cam_model_rules else "default"
+
+        # Check if already processed (suffix depends on model type)
+        if model_type == "polo":
+            det_file = os.path.splitext(v)[0] + f"-detections-polo{clahe_suffix}.parquet"
+        else:
+            det_file = os.path.splitext(v)[0] + f"-detections{clahe_suffix}.parquet"
+
         if not os.path.exists(det_file):
-            to_schedule.append(v)
+            by_model[model_type].append(v)
 
-    print("number of videos to schedule:", len(to_schedule))
+    for model_type, videos in sorted(by_model.items()):
+        print(f"  model_type={model_type}: {len(videos)} videos to schedule")
 
-    # 3) newest-first ordering
-    #    try to parse ..._<YYYY-MM-DD-HH-MM-SS>.h264 from basename; fallback: mtime
-    video_tuples = []
-    for v in to_schedule:
-        base = os.path.basename(v)
-        ts = None
-        # Expected pattern: <cam>_<YYYY-MM-DD-HH-MM-SS>.h264
-        # Get the last "_" segment without extension
-        try:
-            ts_str = os.path.splitext(base)[0].rsplit("_", 1)[-1]
-            ts = datetime.strptime(ts_str, "%Y-%m-%d-%H-%M-%S")
-        except Exception:
-            # fallback to file modification time if parse fails
-            try:
-                ts = datetime.fromtimestamp(os.path.getmtime(v))
-            except Exception:
-                ts = datetime.min
-        video_tuples.append((ts, v))
+    # 3) per model type: sort by timestamp, apply maxjobs cap, yield shards
+    for model_type, videos in sorted(by_model.items()):
+        video_tuples = []
+        for v in videos:
+            base = os.path.basename(v)
+            ts = _parse_rpi_timestamp(base)
+            if ts is None:
+                try:
+                    ts = datetime.fromtimestamp(os.path.getmtime(v))
+                except Exception:
+                    ts = datetime.min
+            video_tuples.append((ts, v))
 
-    # oldest first
-    video_tuples.sort(key=lambda t: t[0], reverse=False)
+        # oldest first
+        video_tuples.sort(key=lambda t: t[0], reverse=False)
 
-    # 4) keep only videos for max number of jobs (if set)
-    if maxjobs is not None:
-        keep = chunk_size * int(maxjobs)
-        video_tuples = video_tuples[:keep]
+        if maxjobs is not None:
+            keep = chunk_size * int(maxjobs)
+            video_tuples = video_tuples[:keep]
 
-    print("number of videos kept with max jobs", len(video_tuples))
+        print(f"  model_type={model_type}: {len(video_tuples)} videos kept after maxjobs")
 
-    # 5) yield in batches of size chunk_size
-    for i in range(0, len(video_tuples), chunk_size):
-        chunk = video_tuples[i : i + chunk_size]
-        yield {
-            "video_paths": [path for _, path in chunk],
-        }
+        for i in range(0, len(video_tuples), chunk_size):
+            chunk = video_tuples[i : i + chunk_size]
+            yield {
+                "video_paths": [path for _, path in chunk],
+                "model_type": model_type,
+            }

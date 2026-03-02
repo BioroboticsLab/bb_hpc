@@ -83,7 +83,7 @@ python -u {runner_path} "{filelist_container}"
     parts += [image, "bash", "-lc", bash]
     return parts
 
-def worker_loop(gpu_id, queue, bind_pairs, image, env, runner_path, jobdir_host, runtime=None):
+def worker_loop(gpu_id, queue, bind_pairs, image, base_env, runner_path, jobdir_host, polo_config, runtime=None):
     bind_map = [(Path(h), Path(c)) for (h, c) in bind_pairs]
     chosen = None
     for h, c in bind_map:
@@ -98,14 +98,32 @@ def worker_loop(gpu_id, queue, bind_pairs, image, env, runner_path, jobdir_host,
 
     while True:
         try:
-            filelist_host = queue.pop(0)
+            filelist_host, model_type = queue.pop(0)
         except IndexError:
             return
+
+        # Build per-container env: inject model type and POLO config if needed
+        env = dict(base_env)
+        env["RPI_MODEL_TYPE"] = model_type
+        if model_type == "polo" and polo_config:
+            env.update(_polo_env_vars(polo_config))
+
         filelist_container = host_to_container_path(filelist_host, host_bind, cont_bind)
         cmd = docker_run_cmd(image, gpu_id, bind_pairs, env, runner_path, filelist_container, runtime=runtime)
-        print(f"[GPU {gpu_id}] starting: {shlex.join(cmd)}", flush=True)
+        print(f"[GPU {gpu_id}] starting ({model_type}): {shlex.join(cmd)}", flush=True)
         rc = subprocess.call(cmd)
-        print(f"[GPU {gpu_id}] finished {filelist_host.name} -> rc={rc}", flush=True)
+        print(f"[GPU {gpu_id}] finished {filelist_host.name} ({model_type}) -> rc={rc}", flush=True)
+
+def _polo_env_vars(polo_cfg):
+    """Build env-var dict for POLO config to inject into containers."""
+    return {
+        "POLO_MODEL_PATH": polo_cfg["polo_model_path"],
+        "POLO_ATTRIBUTES_PATH": polo_cfg["attributes_path"],
+        "POLO_CONFIDENCE_THRESHOLD": str(polo_cfg.get("confidence_threshold", 0.5)),
+        "POLO_IMGSZ": str(polo_cfg.get("imgsz", 640)),
+        "POLO_NMS_RADIUS": str(polo_cfg.get("nms_radius", 30)),
+    }
+
 
 def main():
     args = parse_args()
@@ -114,18 +132,23 @@ def main():
     video_local = Path(settings.pi_videodir_local)
     video_hpc   = Path(settings.pi_videodir_hpc)
 
+    # Per-camera model rules (backward compatible: default to empty)
+    cam_model_rules = getattr(settings, "cam_model_rules", {}) or {}
+    polo_config     = getattr(settings, "polo_config", {}) or {}
+
     # unique per-host timestamped jobdir (avoids collisions across machines)
     host = socket.gethostname()
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     jobdir_host = Path(settings.jobdir_local) / "docker" / s.get("jobname", "rpi_detect") / host / stamp
     jobdir_hpc  = Path(settings.jobdir_hpc)   / "docker" / s.get("jobname", "rpi_detect") / host / stamp
 
-    # Shard videos (LOCAL view), but exclude outputs (suffix depends on CLAHE)
+    # Shard videos (LOCAL view), partitioned by model type
     chunks = list(generate_jobs_rpi_detect(
-        video_root_dir = str(video_local),
-        dates          = args.dates,
-        chunk_size     = int(args.chunk_size),
-        clahe          = bool(args.clahe),
+        video_root_dir   = str(video_local),
+        dates            = args.dates,
+        chunk_size       = int(args.chunk_size),
+        clahe            = bool(args.clahe),
+        cam_model_rules  = cam_model_rules,
     ))
     if not chunks:
         print("Nothing to do.")
@@ -133,13 +156,17 @@ def main():
     print(f"Prepared {len(chunks)} shards (chunk_size={args.chunk_size}, clahe={args.clahe})")
 
     # Translate to HPC paths for containers and write shard filelists
+    # Each entry is (filelist_path, model_type) so we can inject per-container env vars
     filelists = []
     for idx, ch in enumerate(chunks):
+        model_type = ch.get("model_type", "default")
         vids_hpc = host_to_hpc(ch["video_paths"], video_local, video_hpc)
         f = write_filelist(jobdir_host, idx, vids_hpc)
-        filelists.append(f)
+        filelists.append((f, model_type))
 
     if args.dry_run:
+        for f, mt in filelists:
+            print(f"  {f.name}  model_type={mt}")
         print(f"Wrote {len(filelists)} filelists under {jobdir_host} (dry-run).")
         return
 
@@ -157,20 +184,23 @@ def main():
     dkr        = settings.docker
     image      = dkr["image"]
     runner     = dkr.get("runner_path_rpi", "running_k8s/run_rpi_videos.py")
-    env        = dict(dkr.get("env", {}))  # copy
+    base_env   = dict(dkr.get("env", {}))  # copy
     # Pass CLAHE down to the container explicitly (runner reads RPI_CLAHE)
-    env["RPI_CLAHE"] = "1" if args.clahe else "0"
+    base_env["RPI_CLAHE"] = "1" if args.clahe else "0"
     binds      = dkr.get("binds", [])
     runtime    = dkr.get("runtime")
     if runtime:
         print(f"Using Docker runtime: {runtime}")
 
-    # Fan out workers
+    # Fan out workers (queue now holds (filelist, model_type) tuples)
     queue = list(filelists)
     with ThreadPoolExecutor(max_workers=len(gpu_plan)) as ex:
         futs = []
         for gid in gpu_plan:
-            futs.append(ex.submit(worker_loop, gid, queue, binds, image, env, runner, jobdir_host, runtime))
+            futs.append(ex.submit(
+                worker_loop, gid, queue, binds, image, base_env, runner,
+                jobdir_host, polo_config, runtime,
+            ))
         for _ in as_completed(futs):
             pass
 

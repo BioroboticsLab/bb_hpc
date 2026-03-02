@@ -72,7 +72,24 @@ rpi_detect_settings = {
     "jobtime_minutes": 360,
     "chunk_size": 150,
     "maxjobs": None,          # None = as many as needed
-    "use_clahe": True,        # True -> "-c"; False -> "-nc"    
+    "use_clahe": True,        # True -> "-c"; False -> "-nc"
+}
+
+# Camera-to-model mapping for RPi detection (optional).
+# Keys are cam_id prefixes (matched with str.startswith, first match wins).
+# Unmatched cam_ids fall back to "default" (standard heatmap localizer).
+# If absent or empty, all cams use the default pipeline.
+cam_model_rules = {
+    # "feeder": "polo",
+}
+
+# POLO model configuration (only used when a cam maps to "polo").
+polo_config = {
+    "polo_model_path": "/path/to/polo_feeder_weights.torchscript",
+    "attributes_path": "/path/to/localizer_2019_attributes.json",
+    "confidence_threshold": 0.5,
+    "imgsz": 640,
+    "nms_radius": 30,
 }
 
 #-- SLURM-specific settings

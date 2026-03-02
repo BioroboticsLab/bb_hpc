@@ -28,6 +28,20 @@ else:
     except Exception:
         USE_CLAHE = True
 
+# Read model type from env (default = standard heatmap localizer)
+MODEL_TYPE = os.environ.get("RPI_MODEL_TYPE", "default").strip().lower()
+
+# Read POLO config from env (only used when model_type == "polo")
+POLO_CONFIG = None
+if MODEL_TYPE == "polo":
+    POLO_CONFIG = {
+        "polo_model_path": os.environ.get("POLO_MODEL_PATH", ""),
+        "attributes_path": os.environ.get("POLO_ATTRIBUTES_PATH", ""),
+        "confidence_threshold": float(os.environ.get("POLO_CONFIDENCE_THRESHOLD", "0.5")),
+        "imgsz": int(os.environ.get("POLO_IMGSZ", "640")),
+        "nms_radius": float(os.environ.get("POLO_NMS_RADIUS", "30")),
+    }
+
 
 #################################################################
 ##### Runner: reuse the job function per-video for metrics    ####
@@ -50,7 +64,12 @@ def main():
     with open(filelist) as f:
         videos = [line.strip() for line in f if line.strip()]
 
-    job_for_process_rpi_videos(videos, clahe=use_clahe)
+    job_for_process_rpi_videos(
+        videos,
+        clahe=use_clahe,
+        model_type=MODEL_TYPE,
+        polo_config=POLO_CONFIG,
+    )
 
 if __name__ == "__main__":
     main()

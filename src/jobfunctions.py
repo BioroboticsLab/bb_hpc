@@ -513,11 +513,17 @@ def job_for_tracking(repo_path, save_path, temp_path, from_dt, to_dt, cam_id):
 #################################################################
 ##### RPI - DETECT
 #################################################################
-def job_for_process_rpi_videos(video_paths=None, clahe=True):
+def job_for_process_rpi_videos(video_paths=None, clahe=True, model_type="default", polo_config=None):
     import bb_behavior.tracking
     import pandas as pd
     from datetime import datetime
     import os
+
+    # Build a POLO pipeline once for the whole shard (avoids per-video model loading)
+    decoder_pipeline = None
+    if model_type == "polo" and polo_config is not None:
+        decoder_pipeline = _build_polo_pipeline(polo_config)
+        print(f"[POLO] pipeline built: model={polo_config.get('polo_model_path')}")
 
     def detect_rpi_video(videofile, n_frames=None, clahe=True):
         filename = os.path.basename(videofile)
@@ -528,10 +534,11 @@ def job_for_process_rpi_videos(video_paths=None, clahe=True):
         confidence_filter = 0.001
         frame_info, video_dataframe = bb_behavior.tracking.detect_markers_in_video(
             videofile,
+            decoder_pipeline=decoder_pipeline,
             timestamps=None,
             fps=10,
             cam_id=cam_id,
-            clahe=clahe,     # <-- the knob
+            clahe=clahe,
             n_frames=n_frames,
             tag_pixel_diameter=tag_pixel_diameter,
             confidence_filter=confidence_filter,
@@ -543,18 +550,64 @@ def job_for_process_rpi_videos(video_paths=None, clahe=True):
         video_dataframe['video_start_timestamp'] = timestamp
         return video_dataframe
 
-    suffix = "-c" if clahe else "-nc"
+    clahe_suffix = "-c" if clahe else "-nc"
+    polo_suffix = "-polo" if model_type == "polo" else ""
+    suffix = f"-detections{polo_suffix}{clahe_suffix}"
 
     for videofile in (video_paths or []):
         # idempotent
-        det_path = os.path.splitext(videofile)[0] + f"-detections{suffix}.parquet"
+        det_path = os.path.splitext(videofile)[0] + f"{suffix}.parquet"
         if os.path.exists(det_path):
             print(f"Skipping already processed video: {videofile}")
             continue
 
         df = detect_rpi_video(videofile, clahe=clahe)
         dirpath, basename = os.path.split(videofile)
-        savename = basename.replace(".h264", f"-detections{suffix}.parquet")
+        savename = basename.replace(".h264", f"{suffix}.parquet")
         df.to_parquet(os.path.join(dirpath, savename))
 
     return True
+
+
+def _build_polo_pipeline(polo_cfg):
+    """Build a bb_pipeline Pipeline using PoloLocalizer instead of Localizer.
+
+    Kept as a module-level function (rather than inline) because it only needs
+    to be importable inside the container where bb_pipeline is installed.
+    """
+    import pipeline
+    import pipeline.pipeline
+    import pipeline.objects
+    from pipeline.stages import (
+        ImageReader,
+        LocalizerPreprocessor,
+        PoloLocalizer,
+        Decoder,
+        ResultMerger,
+    )
+
+    # PoloLocalizer replaces Localizer — exclude Localizer entirely so the
+    # pipeline resolver cannot accidentally pick it.
+    PoloStages = (
+        ImageReader,
+        LocalizerPreprocessor,
+        PoloLocalizer,
+        Decoder,
+        ResultMerger,
+    )
+
+    conf = pipeline.pipeline.get_auto_config()
+    conf["PoloLocalizer"] = {
+        "polo_model_path": polo_cfg["polo_model_path"],
+        "attributes_path": polo_cfg["attributes_path"],
+        "confidence_threshold": str(polo_cfg.get("confidence_threshold", 0.5)),
+        "imgsz": str(polo_cfg.get("imgsz", 640)),
+        "nms_radius": str(polo_cfg.get("nms_radius", 30)),
+    }
+
+    return pipeline.Pipeline(
+        [pipeline.objects.Image],
+        [pipeline.objects.PipelineResult],
+        available_stages=PoloStages,
+        **conf,
+    )

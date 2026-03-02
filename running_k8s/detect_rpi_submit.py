@@ -50,7 +50,8 @@ def write_filelist(dir_host: Path, idx: int, videos_hpc):
 
 
 def make_indexed_job(job_name: str, completions: int, parallelism: int,
-                     filelist_dir_pod: str, runner_path: str, use_clahe: bool):
+                     filelist_dir_pod: str, runner_path: str, use_clahe: bool,
+                     model_type: str = "default", polo_config: dict = None):
     """
     Build a single Job with Indexed completions.
     Each Pod computes: FILELIST=.../videos_${JOB_COMPLETION_INDEX}.txt
@@ -65,6 +66,15 @@ def make_indexed_job(job_name: str, completions: int, parallelism: int,
 
     # Add CLAHE switch for the runner (runner reads RPI_CLAHE)
     env_list.append({"name": "RPI_CLAHE", "value": "1" if use_clahe else "0"})
+
+    # Add model type and POLO config if needed
+    env_list.append({"name": "RPI_MODEL_TYPE", "value": model_type})
+    if model_type == "polo" and polo_config:
+        env_list.append({"name": "POLO_MODEL_PATH", "value": polo_config["polo_model_path"]})
+        env_list.append({"name": "POLO_ATTRIBUTES_PATH", "value": polo_config["attributes_path"]})
+        env_list.append({"name": "POLO_CONFIDENCE_THRESHOLD", "value": str(polo_config.get("confidence_threshold", 0.5))})
+        env_list.append({"name": "POLO_IMGSZ", "value": str(polo_config.get("imgsz", 640))})
+        env_list.append({"name": "POLO_NMS_RADIUS", "value": str(polo_config.get("nms_radius", 30))})
 
     # Choose worker env var based on whether this job requests GPUs
     def _has_gpu(res_block: dict) -> bool:
@@ -194,68 +204,88 @@ def main():
     video_local = Path(settings.pi_videodir_local)
     video_hpc   = Path(settings.pi_videodir_hpc)
 
+    # Per-camera model rules (backward compatible: default to empty)
+    cam_model_rules = getattr(settings, "cam_model_rules", {}) or {}
+    polo_config     = getattr(settings, "polo_config", {}) or {}
+
     # Where to write filelists on the submission machine (LOCAL) and
     # where the Pod will read the same directory (HPC path)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     filelist_dir_host = Path(settings.jobdir_local) / "k8s" / "rpi" / stamp
     filelist_dir_pod  = Path(settings.jobdir_hpc)   / "k8s" / "rpi" / stamp
 
-    # ---------- build chunks ----------
+    # ---------- build chunks (partitioned by model type) ----------
     s = settings.rpi_detect_settings
     chunk_sz = int(s.get("chunk_size", 150))
     use_clahe = bool(s.get("use_clahe", True))
 
     chunks = list(generate_jobs_rpi_detect(
-        video_root_dir = str(video_local),
-        dates          = args.dates,
-        chunk_size     = chunk_sz,
-        clahe          = use_clahe,
+        video_root_dir  = str(video_local),
+        dates           = args.dates,
+        chunk_size      = chunk_sz,
+        clahe           = use_clahe,
+        cam_model_rules = cam_model_rules,
     ))
     if not chunks:
         print("No work to submit.")
         return
 
-    # ---------- write filelists (HPC-style paths) ----------
-    for idx, ch in enumerate(chunks):
-        vids_hpc = map_local_to_hpc(ch["video_paths"], video_local, video_hpc)
-        write_filelist(filelist_dir_host, idx, vids_hpc)
+    # ---------- group chunks by model type ----------
+    from collections import defaultdict
+    chunks_by_model = defaultdict(list)
+    for ch in chunks:
+        mt = ch.get("model_type", "default")
+        chunks_by_model[mt].append(ch)
 
-    # ---------- single Indexed Job ----------
-    jobname       = s.get("jobname", "rpi-detect")
-    full_job_name = f"{jobname}-{stamp}"
-    par           = int(settings.k8s["job"].get("parallelism", 1))
-    # Default to the repo path mounted in the pod if not overridden in settings.k8s
-    runner_path   = settings.k8s.get(
+    jobname     = s.get("jobname", "rpi-detect")
+    par         = int(settings.k8s["job"].get("parallelism", 1))
+    runner_path = settings.k8s.get(
         "runner_path_rpi",
         os.path.join(settings.bb_hpc_dir_hpc, "running_k8s/run_rpi_videos.py"),
     )
 
-    job_dict = make_indexed_job(
-        job_name         = full_job_name,
-        completions      = len(chunks),
-        parallelism      = par,
-        filelist_dir_pod = str(filelist_dir_pod),
-        runner_path      = runner_path,
-        use_clahe        = use_clahe,
-    )
+    spec_paths = []
+    for model_type, model_chunks in sorted(chunks_by_model.items()):
+        # Write filelists for this model type into a subdirectory
+        fl_host = filelist_dir_host / model_type
+        fl_pod  = filelist_dir_pod  / model_type
+        for idx, ch in enumerate(model_chunks):
+            vids_hpc = map_local_to_hpc(ch["video_paths"], video_local, video_hpc)
+            write_filelist(fl_host, idx, vids_hpc)
 
-    # write one spec file (JSON is fine)
-    spec_path = filelist_dir_host / f"{full_job_name}.json"
-    spec_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(spec_path, "w") as f:
-        json.dump(job_dict, f, indent=2)
-    print(f"Wrote {spec_path}  (completions={len(chunks)}, parallelism={par})")
+        # One Indexed Job per model type
+        full_job_name = f"{jobname}-{model_type}-{stamp}" if len(chunks_by_model) > 1 else f"{jobname}-{stamp}"
+
+        job_dict = make_indexed_job(
+            job_name         = full_job_name,
+            completions      = len(model_chunks),
+            parallelism      = par,
+            filelist_dir_pod = str(fl_pod),
+            runner_path      = runner_path,
+            use_clahe        = use_clahe,
+            model_type       = model_type,
+            polo_config      = polo_config if model_type == "polo" else None,
+        )
+
+        spec_path = filelist_dir_host / f"{full_job_name}.json"
+        spec_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(spec_path, "w") as f:
+            json.dump(job_dict, f, indent=2)
+        print(f"Wrote {spec_path}  (model={model_type}, completions={len(model_chunks)}, parallelism={par})")
+        spec_paths.append(spec_path)
 
     if args.dry_run:
-        print("Dry run: not applying Job.")
+        print("Dry run: not applying Job(s).")
         return
 
     # ---------- apply ----------
-    subprocess.run(
-        ["kubectl", "apply", "-f", str(spec_path), "-n", settings.k8s["namespace"]],
-        check=True
-    )
-    print(f"Submitted Job {full_job_name} in ns {settings.k8s['namespace']}")
+    for spec_path in spec_paths:
+        subprocess.run(
+            ["kubectl", "apply", "-f", str(spec_path), "-n", settings.k8s["namespace"]],
+            check=True,
+        )
+        print(f"Submitted Job from {spec_path.name} in ns {settings.k8s['namespace']}")
+
     print(f"Filelists dir (host): {filelist_dir_host}")
     print(f"Filelists dir (pod) : {filelist_dir_pod}")
 

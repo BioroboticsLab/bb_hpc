@@ -27,7 +27,11 @@ def main():
     s = settings.rpi_detect_settings
     base_slurm = settings.slurm
     # Merge with "specific overrides general"
-    slurm_cfg = resolve_slurm_config(base_slurm, s)   
+    slurm_cfg = resolve_slurm_config(base_slurm, s)
+
+    # Per-camera model rules (backward compatible: default to empty)
+    cam_model_rules = getattr(settings, "cam_model_rules", {}) or {}
+    polo_config     = getattr(settings, "polo_config", {}) or {}
 
     # Simplified: prefer unified HPC-style paths; fallback to legacy names
     chunk_size      = int(s.get("chunk_size", 150))
@@ -35,18 +39,22 @@ def main():
     print('Use clahe:', use_clahe)
 
     # ---------- build per-shard jobs (list-of-videos) ----------
-    # generate_jobs_rpi_detect(...) yields shards with "video_paths"
+    # generate_jobs_rpi_detect(...) yields shards with "video_paths" and "model_type"
     jobs_kwargs = []
     for shard in generate_jobs_rpi_detect(
         video_root_dir=str(settings.pi_videodir_hpc),
         dates=args.dates,
         chunk_size=chunk_size,
         clahe=use_clahe,
+        cam_model_rules=cam_model_rules,
     ):
         vids = shard.get("video_paths", [])
+        model_type = shard.get("model_type", "default")
         if vids:
-            # job_for_process_rpi_videos(videos) expects the videos as a list
-            jobs_kwargs.append({"video_paths": vids, "clahe": use_clahe})
+            kw = {"video_paths": vids, "clahe": use_clahe, "model_type": model_type}
+            if model_type == "polo" and polo_config:
+                kw["polo_config"] = polo_config
+            jobs_kwargs.append(kw)
 
     if not jobs_kwargs:
         print("Nothing to submit.")
