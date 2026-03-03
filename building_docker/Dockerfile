@@ -80,7 +80,7 @@ ENV SETUPTOOLS_USE_DISTUTILS=local
 RUN pip uninstall -y bb_binary bb_pipeline bb_tracking bb_behavior bb_utils 2>/dev/null || true && \
     pip install --upgrade \
       "git+https://github.com/BioroboticsLab/bb_binary#egg=bb_binary" \
-      "git+https://github.com/BioroboticsLab/bb_pipeline#egg=bb_pipeline" \
+      "git+https://github.com/BioroboticsLab/bb_pipeline@pytorch#egg=bb_pipeline" \
       "git+https://github.com/BioroboticsLab/bb_tracking#egg=bb_tracking" \
       "git+https://github.com/BioroboticsLab/bb_behavior#egg=bb_behavior" \
       "git+https://github.com/BioroboticsLab/bb_utils#egg=bb_utils"
@@ -106,11 +106,12 @@ RUN . /opt/conda/etc/profile.d/conda.sh && \
       decoder_2019_keras3.h5 \
       localizer_2019_keras3.h5 \
       localizer_2019_attributes.json \
+      polo26_feedercams.torchscript \
       detection_model_4.json \
       tracklet_model_8.json; do \
       case "$f" in \
         decoder_2019_keras3.h5)                  subdir="decoder"  ;; \
-        localizer_2019_keras3.h5|localizer_2019_attributes.json) subdir="saliency" ;; \
+        localizer_2019_keras3.h5|localizer_2019_attributes.json|polo26_feedercams.torchscript) subdir="saliency" ;; \
         detection_model_4.json|tracklet_model_8.json)           subdir="tracking" ;; \
       esac && \
       wget -q -O "$MODEL_DIR/$f" \
