@@ -40,6 +40,7 @@ if MODEL_TYPE == "polo":
         "confidence_threshold": float(os.environ.get("POLO_CONFIDENCE_THRESHOLD", "0.5")),
         "imgsz": int(os.environ.get("POLO_IMGSZ", "640")),
         "nms_radius": float(os.environ.get("POLO_NMS_RADIUS", "30")),
+        "device": os.environ.get("POLO_DEVICE", "auto"),
     }
 
 

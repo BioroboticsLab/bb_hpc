@@ -603,6 +603,7 @@ def _build_polo_pipeline(polo_cfg):
         "confidence_threshold": str(polo_cfg.get("confidence_threshold", 0.5)),
         "imgsz": str(polo_cfg.get("imgsz", 640)),
         "nms_radius": str(polo_cfg.get("nms_radius", 30)),
+        "device": str(polo_cfg.get("device", "auto")),
     }
 
     return pipeline.Pipeline(
