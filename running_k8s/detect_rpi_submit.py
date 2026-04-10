@@ -59,7 +59,7 @@ def make_indexed_job(job_name: str, completions: int, parallelism: int,
     """
     k = settings.k8s
 
-    # Env passed via Kubernetes (includes your PYTHONPATH, TF_* flags, etc.)
+    # Env passed via Kubernetes (includes your PYTHONPATH, threading flags, etc.)
     env_list = [{"name": k_, "value": str(v_)} for k_, v_ in k.get("env", {}).items()]
     # Prefer CPU-only resources for RPi if provided
     resources = k.get("resources_rpi", k["resources"])

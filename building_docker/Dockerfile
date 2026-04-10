@@ -43,7 +43,7 @@ SHELL ["/bin/bash", "-lc"]
 ###############################################################################
 # Stage 3: STEP3
 #   - Create the "beesbook" conda env with Python 3.12
-#   - Install pip, core Python libraries, and TensorFlow
+#   - Install pip, core Python libraries, and PyTorch
 ###############################################################################
 FROM step2 AS step3
 
@@ -56,9 +56,8 @@ RUN conda create -n beesbook python=3.12 -y && \
        jupyterlab matplotlib scipy seaborn numpy ffmpeg dill tqdm chardet \
        lapack blas sqlite && \
     python -m pip install cairocffi && \
-    python -m pip install tensorflow[and-cuda] && \
-    pip install --index-url https://download.pytorch.org/whl/cu128 \
-        torch torchvision torchaudio && \    
+    pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
+        torch torchvision torchaudio && \
     conda clean --all -y
 
 ENV CONDA_DEFAULT_ENV=beesbook \
@@ -80,7 +79,7 @@ ENV SETUPTOOLS_USE_DISTUTILS=local
 RUN pip uninstall -y bb_binary bb_pipeline bb_tracking bb_behavior bb_utils 2>/dev/null || true && \
     pip install --upgrade \
       "git+https://github.com/BioroboticsLab/bb_binary#egg=bb_binary" \
-      "git+https://github.com/BioroboticsLab/bb_pipeline@pytorch#egg=bb_pipeline" \
+      "git+https://github.com/BioroboticsLab/bb_pipeline#egg=bb_pipeline" \
       "git+https://github.com/BioroboticsLab/bb_tracking#egg=bb_tracking" \
       "git+https://github.com/BioroboticsLab/bb_behavior#egg=bb_behavior" \
       "git+https://github.com/BioroboticsLab/bb_utils#egg=bb_utils"
@@ -93,7 +92,7 @@ FROM step4 AS step5
 RUN . /opt/conda/etc/profile.d/conda.sh && \
     conda activate beesbook && \
     \
-    # 1) Locate pipeline package dir, suppressing noisy TF logs
+    # 1) Locate pipeline package dir
     BB_PIPELINE_DIR=$(python - <<<'import sys;from io import StringIO;sys.stdout=StringIO();import pipeline;sys.stdout=sys.__stdout__;print(pipeline.__path__[0])') && \
     \
     # 2) Prepare model dir
@@ -103,15 +102,15 @@ RUN . /opt/conda/etc/profile.d/conda.sh && \
     # 3) Download all model files
     echo "Downloading model files…" && \
     for f in \
-      decoder_2019_keras3.h5 \
-      localizer_2019_keras3.h5 \
+      decoder_2019_weights.pt \
+      localizer_2019_weights.pt \
       localizer_2019_attributes.json \
       polo26_feedercams.torchscript \
       detection_model_4.json \
       tracklet_model_8.json; do \
       case "$f" in \
-        decoder_2019_keras3.h5)                  subdir="decoder"  ;; \
-        localizer_2019_keras3.h5|localizer_2019_attributes.json|polo26_feedercams.torchscript) subdir="saliency" ;; \
+        decoder_2019_weights.pt)                  subdir="decoder"  ;; \
+        localizer_2019_weights.pt|localizer_2019_attributes.json|polo26_feedercams.torchscript) subdir="saliency" ;; \
         detection_model_4.json|tracklet_model_8.json)           subdir="tracking" ;; \
       esac && \
       wget -q -O "$MODEL_DIR/$f" \
@@ -122,9 +121,10 @@ RUN . /opt/conda/etc/profile.d/conda.sh && \
     echo "Patching config.ini…" && \
     CONFIG_FILE="$BB_PIPELINE_DIR/config.ini" && \
     sed -i \
-      -e "s|^model_path=decoder_.*\.h5\$|model_path=$MODEL_DIR/decoder_2019_keras3.h5|" \
-      -e "s|^model_path=localizer_.*\.h5\$|model_path=$MODEL_DIR/localizer_2019_keras3.h5|" \
+      -e "s|^model_path=decoder_.*|model_path=$MODEL_DIR/decoder_2019_weights.pt|" \
+      -e "s|^model_path=localizer_.*|model_path=$MODEL_DIR/localizer_2019_weights.pt|" \
       -e "s|^attributes_path=.*\.json\$|attributes_path=$MODEL_DIR/localizer_2019_attributes.json|" \
+      -e "s|^polo_model_path=.*|polo_model_path=$MODEL_DIR/polo26_feedercams.torchscript|" \
       "$CONFIG_FILE"
 
 ###############################################################################

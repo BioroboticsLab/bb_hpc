@@ -50,8 +50,11 @@ docker buildx build \
 
 
 ## Finishing and pushing
-docker tag jacobdavidson/beesbook:latest jacobdavidson/beesbook:latest
 # docker login
 docker push jacobdavidson/beesbook:latest
+
+## Also push to K8s registry
+docker tag jacobdavidson/beesbook:latest ccu-k8s.inf.uni-konstanz.de:32250/jacob.davidson/beesbook:latest
+docker push ccu-k8s.inf.uni-konstanz.de:32250/jacob.davidson/beesbook:latest
 ## Notes
 # add --load in order to be able to access the build step in successive steps

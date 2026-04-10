@@ -33,15 +33,10 @@ detect_settings = {
         "max_memory": "6GB",
         "gres": None,
         "exports": (
-            "TF_CPP_MIN_LOG_LEVEL=1,"
             "OMP_NUM_THREADS=1,"
             "MKL_NUM_THREADS=1,"
-            "TF_NUM_INTRAOP_THREADS=1,"
-            "TF_NUM_INTEROP_THREADS=1,"
-            "TF_XLA_FLAGS=--tf_xla_enable_xla_devices=0,"
             "KMP_BLOCKTIME=0,"
-            "KMP_AFFINITY=granularity=fine,verbose,scatter,"
-            "XLA_FLAGS=--xla_gpu_strict_conv_algorithm_picker=false"
+            "KMP_AFFINITY=granularity=fine,verbose,scatter"
         ),
     },
 }
@@ -144,12 +139,6 @@ k8s = {
         "OMP_NUM_THREADS": "1",
         "MKL_NUM_THREADS": "1",
         "MALLOC_ARENA_MAX": "2",
-        "TF_FORCE_GPU_ALLOW_GROWTH": "true",
-        "TF_CPP_MIN_LOG_LEVEL": "1",
-        "TF_XLA_FLAGS": "--tf_xla_auto_jit=0",
-        "TF_ENABLE_ONEDNN_OPTS": "0",
-        "TF_NUM_INTRAOP_THREADS": "1",
-        "TF_NUM_INTEROP_THREADS": "1",
         "PYTHONPATH": bb_hpc_dir_hpc,  # additional path to include
     },
 
@@ -226,8 +215,6 @@ docker = {
         "OMP_NUM_THREADS": "1",
         "MKL_NUM_THREADS": "1",
         "MALLOC_ARENA_MAX": "2",
-        "TF_FORCE_GPU_ALLOW_GROWTH": "true",
-        "TF_CPP_MIN_LOG_LEVEL": "1",
         "PYTHONPATH": bb_hpc_dir_hpc,  # additional path to include
     },
 
