@@ -79,8 +79,10 @@ cam_model_rules = {
 }
 
 # POLO model configuration (only used when a cam maps to "polo").
+# polo_model_path: base name (no _cpu/_cuda suffix, no .torchscript extension).
+# PoloLocalizer picks the device-specific variant at load time.
 polo_config = {
-    "polo_model_path": "/path/to/polo_feeder_weights.torchscript",
+    "polo_model_path": "/path/to/polo26_feedercams",
     "attributes_path": "/path/to/localizer_2019_attributes.json",
     "confidence_threshold": 0.5,
     "imgsz": 640,

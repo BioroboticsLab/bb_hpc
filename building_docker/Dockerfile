@@ -105,12 +105,13 @@ RUN . /opt/conda/etc/profile.d/conda.sh && \
       decoder_2019_weights.pt \
       localizer_2019_weights.pt \
       localizer_2019_attributes.json \
-      polo26_feedercams.torchscript \
+      polo26_feedercams_cpu.torchscript \
+      polo26_feedercams_cuda.torchscript \
       detection_model_4.json \
       tracklet_model_8.json; do \
       case "$f" in \
         decoder_2019_weights.pt)                  subdir="decoder"  ;; \
-        localizer_2019_weights.pt|localizer_2019_attributes.json|polo26_feedercams.torchscript) subdir="saliency" ;; \
+        localizer_2019_weights.pt|localizer_2019_attributes.json|polo26_feedercams_cpu.torchscript|polo26_feedercams_cuda.torchscript) subdir="saliency" ;; \
         detection_model_4.json|tracklet_model_8.json)           subdir="tracking" ;; \
       esac && \
       wget -q -O "$MODEL_DIR/$f" \
@@ -124,7 +125,7 @@ RUN . /opt/conda/etc/profile.d/conda.sh && \
       -e "s|^model_path=decoder_.*|model_path=$MODEL_DIR/decoder_2019_weights.pt|" \
       -e "s|^model_path=localizer_.*|model_path=$MODEL_DIR/localizer_2019_weights.pt|" \
       -e "s|^attributes_path=.*\.json\$|attributes_path=$MODEL_DIR/localizer_2019_attributes.json|" \
-      -e "s|^polo_model_path=.*|polo_model_path=$MODEL_DIR/polo26_feedercams.torchscript|" \
+      -e "s|^polo_model_path=.*|polo_model_path=$MODEL_DIR/polo26_feedercams|" \
       "$CONFIG_FILE"
 
 ###############################################################################
