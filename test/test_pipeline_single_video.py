@@ -124,13 +124,19 @@ def main():
     try:
         if args.mode == "hd":
             run_hd(args)
-            # Count bb_binary files produced
-            result["bbb_files"] = len(glob.glob(os.path.join(args.out, "**", "*.bbb"),
-                                                recursive=True))
+            n_out = len(glob.glob(os.path.join(args.out, "**", "*.bbb"), recursive=True))
+            result["bbb_files"] = n_out
         else:
             run_polo(args)
-            result["parquet_files"] = len(glob.glob(os.path.join(args.out, "*.parquet")))
-        result["rc"] = 0
+            n_out = len(glob.glob(os.path.join(args.out, "*.parquet")))
+            result["parquet_files"] = n_out
+        # job_for_process_videos catches per-video exceptions as [WARN]s, so an
+        # empty output directory is the real failure signal.
+        if n_out == 0:
+            result["rc"] = 1
+            result["error"] = "no output files produced (see [WARN] above)"
+        else:
+            result["rc"] = 0
     except Exception as e:
         import traceback
         traceback.print_exc()
