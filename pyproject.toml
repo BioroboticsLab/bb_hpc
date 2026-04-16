@@ -7,7 +7,9 @@ name = "bb_hpc"
 version = "0.0.1"
 description = "Beesbook HPC orchestration (slurm + kubernetes)"
 requires-python = ">=3.9"
-dependencies = []
+dependencies = [
+    "slurmhelper @ git+https://github.com/walachey/slurmhelper.git",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]   
