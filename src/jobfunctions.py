@@ -545,14 +545,12 @@ def job_for_process_rpi_videos(video_paths=None, clahe=True, model_type="default
         )
 
         conf = pipeline.pipeline.get_auto_config()
-        conf["PoloLocalizer"] = {
-            "polo_model_path": polo_cfg["polo_model_path"],
-            "attributes_path": polo_cfg["attributes_path"],
-            "confidence_threshold": str(polo_cfg.get("confidence_threshold", 0.5)),
-            "imgsz": str(polo_cfg.get("imgsz", 640)),
-            "nms_radius": str(polo_cfg.get("nms_radius", 30)),
-            "device": str(polo_cfg.get("device", "auto")),
-        }
+        # Merge hyperparameters from polo_cfg; model paths come from
+        # config.ini (sed-patched at install time for each machine).
+        conf.setdefault("PoloLocalizer", {})
+        for key in ("confidence_threshold", "imgsz", "nms_radius", "device"):
+            if key in polo_cfg:
+                conf["PoloLocalizer"][key] = str(polo_cfg[key])
 
         return pipeline.Pipeline(
             [pipeline.objects.Image],
@@ -565,7 +563,7 @@ def job_for_process_rpi_videos(video_paths=None, clahe=True, model_type="default
     decoder_pipeline = None
     if model_type == "polo" and polo_config is not None:
         decoder_pipeline = _build_polo_pipeline(polo_config)
-        print(f"[POLO] pipeline built: model={polo_config.get('polo_model_path')}")
+        print("[POLO] pipeline built")
 
     def detect_rpi_video(videofile, n_frames=None, clahe=True):
         filename = os.path.basename(videofile)
