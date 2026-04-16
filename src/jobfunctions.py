@@ -519,6 +519,48 @@ def job_for_process_rpi_videos(video_paths=None, clahe=True, model_type="default
     from datetime import datetime
     import os
 
+    def _build_polo_pipeline(polo_cfg):
+        """Build a bb_pipeline Pipeline using PoloLocalizer instead of Localizer.
+
+        Inlined here (not module-level) so slurmhelper can serialize this
+        function as a standalone job.
+        """
+        import pipeline
+        import pipeline.pipeline
+        import pipeline.objects
+        from pipeline.stages import (
+            ImageReader,
+            LocalizerPreprocessor,
+            PoloLocalizer,
+            Decoder,
+            ResultMerger,
+        )
+
+        PoloStages = (
+            ImageReader,
+            LocalizerPreprocessor,
+            PoloLocalizer,
+            Decoder,
+            ResultMerger,
+        )
+
+        conf = pipeline.pipeline.get_auto_config()
+        conf["PoloLocalizer"] = {
+            "polo_model_path": polo_cfg["polo_model_path"],
+            "attributes_path": polo_cfg["attributes_path"],
+            "confidence_threshold": str(polo_cfg.get("confidence_threshold", 0.5)),
+            "imgsz": str(polo_cfg.get("imgsz", 640)),
+            "nms_radius": str(polo_cfg.get("nms_radius", 30)),
+            "device": str(polo_cfg.get("device", "auto")),
+        }
+
+        return pipeline.Pipeline(
+            [pipeline.objects.Image],
+            [pipeline.objects.PipelineResult],
+            available_stages=PoloStages,
+            **conf,
+        )
+
     # Build a POLO pipeline once for the whole shard (avoids per-video model loading)
     decoder_pipeline = None
     if model_type == "polo" and polo_config is not None:
@@ -569,46 +611,3 @@ def job_for_process_rpi_videos(video_paths=None, clahe=True, model_type="default
     return True
 
 
-def _build_polo_pipeline(polo_cfg):
-    """Build a bb_pipeline Pipeline using PoloLocalizer instead of Localizer.
-
-    Kept as a module-level function (rather than inline) because it only needs
-    to be importable inside the container where bb_pipeline is installed.
-    """
-    import pipeline
-    import pipeline.pipeline
-    import pipeline.objects
-    from pipeline.stages import (
-        ImageReader,
-        LocalizerPreprocessor,
-        PoloLocalizer,
-        Decoder,
-        ResultMerger,
-    )
-
-    # PoloLocalizer replaces Localizer — exclude Localizer entirely so the
-    # pipeline resolver cannot accidentally pick it.
-    PoloStages = (
-        ImageReader,
-        LocalizerPreprocessor,
-        PoloLocalizer,
-        Decoder,
-        ResultMerger,
-    )
-
-    conf = pipeline.pipeline.get_auto_config()
-    conf["PoloLocalizer"] = {
-        "polo_model_path": polo_cfg["polo_model_path"],
-        "attributes_path": polo_cfg["attributes_path"],
-        "confidence_threshold": str(polo_cfg.get("confidence_threshold", 0.5)),
-        "imgsz": str(polo_cfg.get("imgsz", 640)),
-        "nms_radius": str(polo_cfg.get("nms_radius", 30)),
-        "device": str(polo_cfg.get("device", "auto")),
-    }
-
-    return pipeline.Pipeline(
-        [pipeline.objects.Image],
-        [pipeline.objects.PipelineResult],
-        available_stages=PoloStages,
-        **conf,
-    )
