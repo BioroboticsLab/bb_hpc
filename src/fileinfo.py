@@ -98,8 +98,8 @@ def _list_rpi_day(day_dir: Path, day_str: str, video_glob_pattern: str) -> pd.Da
             "cam": cam,
             "video_name": base,
             "full_path": path,
-            "detections_clahe": os.path.exists(root + "-detections-c.parquet"),
-            "detections_noclahe": os.path.exists(root + "-detections-nc.parquet"),
+            "detections_clahe": os.path.exists(root + "-detections-c.parquet") or os.path.exists(root + "-detections-polo-c.parquet"),
+            "detections_noclahe": os.path.exists(root + "-detections-nc.parquet") or os.path.exists(root + "-detections-polo-nc.parquet"),
         })
     cols = ["date", "cam", "video_name", "full_path", "detections_clahe", "detections_noclahe"]
     return pd.DataFrame(rows, columns=cols)
