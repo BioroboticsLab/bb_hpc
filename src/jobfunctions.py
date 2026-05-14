@@ -414,7 +414,29 @@ def job_for_tracking(repo_path, save_path, temp_path, from_dt, to_dt, cam_id):
         # Monkey-patch
         _dw.iterate_bb_binary_repository = _iter_wrap
     # ---- end compatibility patch ----
-    
+
+    # ---- Empty-frame compatibility patch for scipy.cKDTree ----
+    # bb_tracking.data_walker.iterate_bb_binary_repository calls
+    # scipy.spatial.cKDTree(xy) unconditionally. When a frame has zero
+    # detections (briefly obscured hive, lid event, etc.) xy is empty and
+    # cKDTree raises ValueError, which terminates the generator. Replace
+    # with an empty-tree-aware wrapper so the frame is still yielded but
+    # contains no neighbors. Scoped via try/finally further below so the
+    # patch is restored when this function returns.
+    import numpy as _np_ckdtree
+    import scipy.spatial as _sp_spatial
+    _orig_ckdtree = _sp_spatial.cKDTree
+    def _ckdtree_empty_safe(data, *a, **kw):
+        try:
+            n = len(data)
+        except TypeError:
+            n = -1
+        if n == 0:
+            return _orig_ckdtree(_np_ckdtree.empty((0, 2)), *a, **kw)
+        return _orig_ckdtree(data, *a, **kw)
+    _sp_spatial.cKDTree = _ckdtree_empty_safe
+    # ---- end empty-frame patch ----
+
     output_filename_tmp = os.path.join(temp_path,get_video_fname(cam_id, from_dt, to_dt)+'.dill.tmp')
     output_filename = os.path.join(save_path,get_video_fname(cam_id, from_dt, to_dt)+'.dill')
 
@@ -469,46 +491,76 @@ def job_for_tracking(repo_path, save_path, temp_path, from_dt, to_dt, cam_id):
         # Incrementally save the results batch into the .dill file
         dill.dump(batch, results_file)
 
-    with open(output_filename_tmp, "wb") as results_file:
-        # Get an iterator from the generator
-        tracker_iter = iter(tracker)
-        track = None 
-        
-        while True:
-            try:
-                # Try to get the next track from the generator
-                track = next(tracker_iter)
-            except StopIteration:
-                print('reached the end')
-                break
-            except Exception as e:
-                print(f"Error occurred while retrieving the next track: {e}")
-                import traceback; traceback.print_exc()
-                # inspect problematic detections (avoid relying on __dict__ on capnp objects)
-                if hasattr(track, 'detections'):
-                    for det in track.detections[:5]:
-                        try:
-                            # Print a compact summary
-                            print("Det:",
-                                  getattr(det, "timestamp", None),
-                                  getattr(det, "frame_id", None),
-                                  getattr(det, "detection_index", None),
-                                  getattr(det, "x_pixels", None),
-                                  getattr(det, "y_pixels", None))
-                        except Exception:
-                            # best-effort
-                            print("Det:<unprintable>")
-                continue 
-            try:
-                process_track(track, cam_id, results_file)
-            except Exception as e:
-                print(f"Error processing track {track.id}: {e}")
-                if hasattr(track, 'timestamps'):
-                    print(f"Timestamps: {track.timestamps}")
-                continue  # Continue to the next track if processing failed
-    # If successful, rename the file by removing the '.tmp' extension
-    shutil.move(output_filename_tmp, output_filename)
-    print(f"Processing completed: {output_filename}")    
+    success = False
+    had_iterator_error = False
+    had_track_error = False
+    tracks_written = 0
+    try:
+        with open(output_filename_tmp, "wb") as results_file:
+            tracker_iter = iter(tracker)
+            track = None
+
+            while True:
+                try:
+                    track = next(tracker_iter)
+                except StopIteration:
+                    print('reached the end')
+                    success = True
+                    break
+                except MemoryError:
+                    raise
+                except Exception as e:
+                    had_iterator_error = True
+                    print(f"Error occurred while retrieving the next track: {e}")
+                    import traceback; traceback.print_exc()
+                    if hasattr(track, 'detections'):
+                        for det in track.detections[:5]:
+                            try:
+                                print("Det:",
+                                      getattr(det, "timestamp", None),
+                                      getattr(det, "frame_id", None),
+                                      getattr(det, "detection_index", None),
+                                      getattr(det, "x_pixels", None),
+                                      getattr(det, "y_pixels", None))
+                            except Exception:
+                                print("Det:<unprintable>")
+                    continue
+                try:
+                    process_track(track, cam_id, results_file)
+                    tracks_written += 1
+                except MemoryError:
+                    raise
+                except Exception as e:
+                    had_track_error = True
+                    print(f"Error processing track {track.id}: {e}")
+                    if hasattr(track, 'timestamps'):
+                        print(f"Timestamps: {track.timestamps}")
+                    continue
+    finally:
+        # Restore the original scipy.spatial.cKDTree so the patch does not
+        # leak to other jobs running in the same process.
+        _sp_spatial.cKDTree = _orig_ckdtree
+
+    try:
+        tmp_size = os.path.getsize(output_filename_tmp)
+    except OSError:
+        tmp_size = 0
+
+    if success and not had_iterator_error and tmp_size > 0:
+        shutil.move(output_filename_tmp, output_filename)
+        print(f"tracking done: tracks={tracks_written} had_track_error={had_track_error} -> {output_filename}")
+    else:
+        try:
+            os.remove(output_filename_tmp)
+        except Exception:
+            pass
+        print(
+            f"tracking FAILED: success={success} had_iterator_error={had_iterator_error} "
+            f"had_track_error={had_track_error} tracks={tracks_written} tmp_size={tmp_size}; "
+            f"tmp removed: {output_filename_tmp}"
+        )
+        import sys
+        sys.exit(1)
 
 #################################################################
 ##### RPI - DETECT

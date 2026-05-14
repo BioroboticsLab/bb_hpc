@@ -543,3 +543,86 @@ except Exception:
         return False
     except Exception:
         return False
+
+
+def is_dill_file_valid(dill_file):
+    """
+    Basic validity check for a tracking .dill file.
+
+    A tracking output is a sequence of pickled batches written via
+    `dill.dump(batch, f)` (see bb_hpc.src.jobfunctions.job_for_tracking).
+    Considered invalid if the file does not exist, is 0 bytes, or cannot
+    be opened.
+
+    Use is_dill_file_valid_deep() to also verify the dill stream parses
+    cleanly to end-of-file.
+    """
+    if not os.path.exists(dill_file):
+        return False
+    try:
+        if os.path.getsize(dill_file) == 0:
+            return False
+    except Exception:
+        return False
+    try:
+        with open(dill_file, "rb") as f:
+            f.read(1)
+    except Exception:
+        return False
+    return True
+
+
+def is_dill_file_valid_deep(dill_file):
+    """
+    Deep validation for a tracking .dill file: read every pickled batch in
+    the stream and confirm a clean terminal EOFError at end-of-file.
+
+    Catches zombie .dill files produced when tracking exited mid-write
+    (silent failure path that previously slipped past file-existence checks).
+
+    Runs in a subprocess with timeout to isolate from pathological loads.
+    """
+    if not is_dill_file_valid(dill_file):
+        return False
+
+    script = f'''
+import sys
+import os
+import dill
+
+dill_file = {dill_file!r}
+try:
+    size = os.path.getsize(dill_file)
+except Exception:
+    sys.exit(1)
+
+try:
+    with open(dill_file, "rb") as f:
+        while True:
+            pos = f.tell()
+            if pos == size:
+                sys.exit(0)  # clean EOF at end-of-file -> valid
+            try:
+                dill.load(f)
+                if f.tell() <= pos:
+                    sys.exit(1)  # no progress -> invalid
+            except EOFError:
+                if f.tell() == size:
+                    sys.exit(0)  # clean terminal EOF -> valid
+                sys.exit(1)  # premature EOF -> invalid
+            except Exception:
+                sys.exit(1)  # decode error -> invalid
+except Exception:
+    sys.exit(1)
+'''
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            timeout=60,
+            capture_output=True,
+        )
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+    except Exception:
+        return False
