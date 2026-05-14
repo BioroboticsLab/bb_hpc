@@ -572,18 +572,43 @@ def is_dill_file_valid(dill_file):
     return True
 
 
-def is_dill_file_valid_deep(dill_file):
+def is_dill_file_valid_deep(dill_file, max_end_gap_seconds=300.0):
     """
-    Deep validation for a tracking .dill file: read every pickled batch in
-    the stream and confirm a clean terminal EOFError at end-of-file.
+    Deep validation for a tracking .dill file. Two checks:
 
-    Catches zombie .dill files produced when tracking exited mid-write
-    (silent failure path that previously slipped past file-existence checks).
+      1. Structural: every pickled batch parses cleanly and the stream ends at
+         a terminal EOF (catches 0-byte and truncated-mid-pickle files).
+      2. Timestamp coverage: the latest detection timestamp reaches within
+         `max_end_gap_seconds` of the file's nominal end time (parsed from the
+         filename). This catches "cleanly written but short" zombie files left
+         behind when a tracking run silently stopped early -- those parse fine
+         structurally but only cover the first part of the time window.
 
-    Runs in a subprocess with timeout to isolate from pathological loads.
+    The default 300 s (5 min) gap tolerates legitimate end-of-window effects
+    (missing/removed trailing minute .bbb files, brief obscured-hive periods,
+    track finalization) while still flagging the dramatically-short zombie
+    files, which are typically short by tens of minutes. Pass a smaller value
+    for a stricter check.
+
+    Runs in a subprocess with a timeout to isolate from pathological loads.
     """
     if not is_dill_file_valid(dill_file):
         return False
+
+    # Nominal end time from the filename: Cam_<id>_<start>--<end>.dill
+    to_dt_posix = None
+    try:
+        from bb_binary.parsing import parse_video_fname
+        base = os.path.basename(dill_file)
+        if base.endswith(".dill"):
+            base = base[:-5]
+        _cam, _start, _end = parse_video_fname(base)
+        try:
+            to_dt_posix = _end.timestamp()
+        except AttributeError:
+            to_dt_posix = float(_end)
+    except Exception:
+        to_dt_posix = None  # cannot determine end -> skip the coverage check
 
     script = f'''
 import sys
@@ -591,34 +616,64 @@ import os
 import dill
 
 dill_file = {dill_file!r}
+to_dt_posix = {to_dt_posix!r}
+max_end_gap = {float(max_end_gap_seconds)!r}
+
 try:
     size = os.path.getsize(dill_file)
 except Exception:
     sys.exit(1)
 
+def _as_posix(v):
+    # batch tuple element [0] is det.timestamp: a tz-aware datetime or float epoch
+    try:
+        return v.timestamp()
+    except AttributeError:
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+max_ts = None
 try:
     with open(dill_file, "rb") as f:
         while True:
             pos = f.tell()
             if pos == size:
-                sys.exit(0)  # clean EOF at end-of-file -> valid
+                break  # clean EOF at end-of-file
             try:
-                dill.load(f)
+                batch = dill.load(f)
                 if f.tell() <= pos:
                     sys.exit(1)  # no progress -> invalid
             except EOFError:
                 if f.tell() == size:
-                    sys.exit(0)  # clean terminal EOF -> valid
+                    break  # clean terminal EOF
                 sys.exit(1)  # premature EOF -> invalid
             except Exception:
                 sys.exit(1)  # decode error -> invalid
+            try:
+                for row in batch:
+                    ts = _as_posix(row[0])
+                    if ts is not None and (max_ts is None or ts > max_ts):
+                        max_ts = ts
+            except TypeError:
+                pass  # unexpected batch shape -> ignore for coverage
 except Exception:
     sys.exit(1)
+
+# Timestamp-coverage check
+if to_dt_posix is not None:
+    if max_ts is None:
+        sys.exit(1)  # parsed cleanly but contains no usable detections
+    if (to_dt_posix - max_ts) > max_end_gap:
+        sys.exit(1)  # tracking stopped well before the nominal end of the window
+
+sys.exit(0)
 '''
     try:
         result = subprocess.run(
             [sys.executable, "-c", script],
-            timeout=60,
+            timeout=180,
             capture_output=True,
         )
         return result.returncode == 0

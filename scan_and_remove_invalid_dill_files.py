@@ -65,8 +65,9 @@ def _find_dill_files(track_dir: str, date_yyyymmdd: str) -> list[str]:
     return sorted(p for p in glob.glob(pattern) if not p.endswith(".dill.tmp"))
 
 
-def _validate_file(path: str) -> tuple[str, bool]:
-    return path, is_dill_file_valid_deep(path)
+def _validate_file(args: tuple[str, float]) -> tuple[str, bool]:
+    path, max_end_gap_seconds = args
+    return path, is_dill_file_valid_deep(path, max_end_gap_seconds=max_end_gap_seconds)
 
 
 def _scan_day(
@@ -75,20 +76,22 @@ def _scan_day(
     dry_run: bool,
     verbose: bool,
     num_workers: int = 1,
+    max_end_gap_seconds: float = 300.0,
 ) -> tuple[int, int, int, list[str]]:
     files = _find_dill_files(track_dir, date_yyyymmdd)
     invalid: list[str] = []
 
     if num_workers > 1 and len(files) > 1:
+        work_items = [(path, max_end_gap_seconds) for path in files]
         with Pool(processes=num_workers) as pool:
-            for path, ok in pool.imap_unordered(_validate_file, files, chunksize=4):
+            for path, ok in pool.imap_unordered(_validate_file, work_items, chunksize=4):
                 if not ok:
                     invalid.append(path)
                     if verbose:
                         print(f"[invalid] {path}")
     else:
         for path in files:
-            ok = is_dill_file_valid_deep(path)
+            ok = is_dill_file_valid_deep(path, max_end_gap_seconds=max_end_gap_seconds)
             if not ok:
                 invalid.append(path)
                 if verbose:
@@ -116,6 +119,11 @@ def parse_args():
     p.add_argument("--verbose", action="store_true", help="Print each invalid path.")
     p.add_argument("--num-workers", type=int, default=4,
                    help="Number of parallel workers for validation (default: 4).")
+    p.add_argument("--max-end-gap-seconds", type=float, default=300.0,
+                   help="Flag a .dill as invalid if its last detection is more than this "
+                        "many seconds before the file's nominal end time. Catches "
+                        "cleanly-written-but-short files left by tracking runs that "
+                        "stopped early (default: 300).")
     return p.parse_args()
 
 
@@ -148,7 +156,8 @@ def main():
 
     for d in dates:
         n_files, n_invalid, n_removed, invalid_paths = _scan_day(
-            track_dir, d, args.dry_run, args.verbose, args.num_workers
+            track_dir, d, args.dry_run, args.verbose, args.num_workers,
+            args.max_end_gap_seconds,
         )
         total_files += n_files
         total_invalid += n_invalid
