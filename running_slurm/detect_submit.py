@@ -6,7 +6,7 @@ import argparse, time
 import bb_hpc.settings as settings
 from bb_hpc.src.generate import generate_jobs_detect
 from bb_hpc.src.jobfunctions import job_for_process_videos
-from bb_hpc.src.slurm_utils import resolve_slurm_config, apply_slurm_to_job
+from bb_hpc.src.slurm_utils import resolve_slurm_config, apply_slurm_to_job, run_jobs_and_log
 
 
 # usage: python detect_submit.py --dates 20250710 20250709 ...
@@ -82,7 +82,7 @@ def main():
     job.clear_input_files = lambda: None # this is needed so that createjobs() does not delete existing input files
     job.createjobs()
     job.write_batch_file()
-    job.run_jobs()
+    run_jobs_and_log(job, jobdir, jobname, args.dates)
     print(f"[{time.ctime()}] Checked & submitted any new detect jobs.")
 
 

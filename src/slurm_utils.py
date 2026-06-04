@@ -1,6 +1,11 @@
 # bb_hpc/src/slurm_utils.py
-from datetime import timedelta
+from datetime import datetime, timedelta
+import os
+import io
 import re
+import json
+import contextlib
+import subprocess
 
 def _normalize_mem(mem):
     """Convert '6GB' -> '6G'. Slurm also accepts integer MiB."""
@@ -95,3 +100,68 @@ def apply_slurm_to_job(job, slurm_cfg: dict):
     if n_gpus is None:
         n_gpus = _parse_gres_to_ngpus(slurm_cfg.get("gres"))
     job.n_gpus = int(n_gpus or 0)
+
+
+# --------------------------------------------------------------------------------------
+# Submission logging: record the array job IDs we submit so they can be monitored later
+# with `python -m bb_hpc.slurm_report --jobs <id>`. Best-effort; never blocks a submit.
+# --------------------------------------------------------------------------------------
+def _append_submitted_jobs(jobdir, record):
+    """Append one JSON record to <jobdir>/submitted_jobs.jsonl."""
+    try:
+        os.makedirs(jobdir, exist_ok=True)
+        with open(os.path.join(jobdir, "submitted_jobs.jsonl"), "a") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except Exception as e:
+        print(f"[warn] could not write submitted_jobs.jsonl: {e}")
+
+
+def run_jobs_and_log(job, jobdir, jobname, dates, user=None):
+    """
+    Run ``job.run_jobs()`` while recording the submitted array job IDs.
+
+    Captures stdout to scrape sbatch's ``Submitted batch job <id>`` lines (re-printing
+    everything so console output is unchanged). If nothing is captured -- e.g. slurmhelper
+    writes directly to the OS fd -- falls back to ``squeue`` for this user+jobname. The
+    IDs (plus timestamp/jobname/dates) are appended to ``<jobdir>/submitted_jobs.jsonl``.
+    Wrapped in try/except throughout so logging never blocks a submission.
+
+    Returns the list of job IDs found (possibly empty).
+    """
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            job.run_jobs()
+    finally:
+        captured = buf.getvalue()
+        if captured:
+            print(captured, end="")
+
+    job_ids = re.findall(r"Submitted batch job (\d+)", captured)
+    source = "sbatch"
+    if not job_ids:
+        # Fallback (note: may also include this user's *prior* same-name arrays still queued)
+        try:
+            user = user or os.environ.get("USER", "")
+            out = subprocess.run(
+                ["squeue", "-h", "-u", user, "-n", jobname, "-o", "%A"],
+                capture_output=True, text=True, check=False).stdout
+            job_ids = sorted(set(out.split()))
+            source = "squeue(fallback)"
+        except Exception:
+            job_ids = []
+
+    try:
+        _append_submitted_jobs(jobdir, {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "jobname": jobname,
+            "dates": list(dates) if dates is not None else None,
+            "job_ids": job_ids,
+            "source": source,
+        })
+        if job_ids:
+            print(f"[submitted] {jobname}: {', '.join(job_ids)} "
+                  f"({source}) -> logged to {os.path.join(jobdir, 'submitted_jobs.jsonl')}")
+    except Exception as e:
+        print(f"[warn] submission logging failed: {e}")
+    return job_ids

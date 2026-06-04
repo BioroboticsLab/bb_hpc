@@ -6,7 +6,7 @@ import bb_hpc.settings as settings
 from slurmhelper import SLURMJob
 from bb_hpc.src.generate import generate_jobs_rpi_detect
 from bb_hpc.src.jobfunctions import job_for_process_rpi_videos 
-from bb_hpc.src.slurm_utils import resolve_slurm_config, apply_slurm_to_job
+from bb_hpc.src.slurm_utils import resolve_slurm_config, apply_slurm_to_job, run_jobs_and_log
 
 
 def parse_args():
@@ -77,7 +77,7 @@ def main():
     job.clear_input_files = lambda: None # this is needed so that createjobs() does not delete existing input files
     job.createjobs()
     job.write_batch_file()
-    job.run_jobs()
+    run_jobs_and_log(job, settings.jobdir_hpc, s.get("jobname", "rpi"), args.dates)
     print(f"[{time.ctime()}] Submitted {len(jobs_kwargs)} RPi detect jobs for dates: {' '.join(args.dates)}")
 
 
