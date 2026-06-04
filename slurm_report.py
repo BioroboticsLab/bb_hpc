@@ -25,6 +25,7 @@ import os
 import re
 import sys
 import csv
+import json
 import math
 import argparse
 import subprocess
@@ -420,6 +421,43 @@ def render_markdown(summaries):
     return "\n".join(rows)
 
 
+def read_ledger(jobdir, name_filter=None, limit=20):
+    """Return the last `limit` records from <jobdir>/submitted_jobs.jsonl (written by
+    run_jobs_and_log at submit time), newest last, optionally filtered by job name."""
+    path = os.path.join(jobdir, "submitted_jobs.jsonl")
+    if not os.path.exists(path):
+        print(f"No submission ledger at {path}.\n"
+              "(It is written by run_jobs_and_log on submit; jobs from before that was "
+              "wired up won't be here -- use --name/-S to find those via sacct.)",
+              file=sys.stderr)
+        return None, path
+    recs = []
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if name_filter and r.get("jobname") not in name_filter:
+                continue
+            recs.append(r)
+    return recs[-limit:], path
+
+
+def render_ledger(recs, path):
+    print(f"Recent submissions (from {path}):\n")
+    print(f"{'submitted':<20} {'job':<12} {'ids':<26} dates")
+    print("-" * 76)
+    for r in recs:
+        ids = ",".join(r.get("job_ids") or []) or "(none captured)"
+        dates = ",".join(r.get("dates") or []) if r.get("dates") else "-"
+        print(f"{r.get('ts', '-'):<20} {r.get('jobname', '-'):<12} {ids:<26} {dates}")
+    print("\nProfile one with:  python -m bb_hpc.slurm_report --jobs <id> --markdown")
+
+
 def write_csv(path, tasks):
     cols = ["jobid", "name", "state", "elapsed_s", "timelimit_s",
             "reqmem_kib", "maxrss_kib", "ncpus", "totalcpu_s", "exitcode"]
@@ -453,6 +491,11 @@ def parse_args():
     p.add_argument("--time-margin", type=float, default=1.5)
     p.add_argument("--mem-margin", type=float, default=1.3)
     p.add_argument("--state", default=None, help="sacct --state filter, e.g. COMPLETED,TIMEOUT")
+    p.add_argument("--list", nargs="?", const=20, type=int, metavar="N",
+                   help="list the last N submitted arrays from the ledger (default 20) and "
+                        "exit; combine with --name to filter. Use this to find a job id.")
+    p.add_argument("--jobdir", default=None,
+                   help="dir holding submitted_jobs.jsonl (default: settings.jobdir_hpc)")
     p.add_argument("--markdown", action="store_true", help="also emit an email-ready table")
     p.add_argument("--csv", default=None, help="write per-task rows to this CSV path")
     p.add_argument("-v", "--verbose", action="store_true", help="print the sacct command")
@@ -461,6 +504,19 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # --list: just show what we've submitted (and the array ids) from the ledger
+    if args.list is not None:
+        jobdir = args.jobdir or (getattr(_settings, "jobdir_hpc", None) if _settings else None)
+        if not jobdir:
+            print("ERROR: pass --jobdir (could not import settings.jobdir_hpc).", file=sys.stderr)
+            sys.exit(2)
+        recs, path = read_ledger(jobdir, set(args.name) if args.name else None, args.list)
+        if not recs:
+            sys.exit(1)
+        render_ledger(recs, path)
+        return
+
     if not args.jobs and not args.user:
         print("ERROR: set $USER or pass -u/--user (or use --jobs).", file=sys.stderr)
         sys.exit(2)
