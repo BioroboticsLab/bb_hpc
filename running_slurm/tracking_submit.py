@@ -8,7 +8,7 @@ from slurmhelper import SLURMJob
 
 from bb_hpc.src.generate import generate_jobs_tracking
 from bb_hpc.src.jobfunctions import job_for_tracking
-from bb_hpc.src.slurm_utils import resolve_slurm_config, apply_slurm_to_job
+from bb_hpc.src.slurm_utils import resolve_slurm_config, apply_slurm_to_job, run_jobs_and_log
 
 
 def parse_args():
@@ -75,7 +75,7 @@ def main():
         return
 
     # Submit
-    job.run_jobs()
+    run_jobs_and_log(job, settings.jobdir_hpc, s_trk.get("jobname", "tracking"), args.dates)
     print("[tracking_submit] Submitted.")
 
 

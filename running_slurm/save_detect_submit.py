@@ -5,7 +5,7 @@ from datetime import datetime, timezone, timedelta
 
 from bb_hpc import settings
 from slurmhelper import SLURMJob
-from bb_hpc.src.slurm_utils import resolve_slurm_config, apply_slurm_to_job
+from bb_hpc.src.slurm_utils import resolve_slurm_config, apply_slurm_to_job, run_jobs_and_log
 from bb_hpc.src.generate import generate_jobs_save_detect  
 from bb_hpc.src.jobfunctions import job_for_save_detect_chunk
 
@@ -66,7 +66,7 @@ def main():
         return
 
     # Submit arrays (respects max_job_array_size / concurrent_job_limit)
-    job.run_jobs()
+    run_jobs_and_log(job, settings.jobdir_hpc, s_sd.get("jobname", "save_detect"), args.dates)
     print("[save_detect_submit] Submitted.")
 
 
