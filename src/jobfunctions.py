@@ -570,6 +570,7 @@ def job_for_process_rpi_videos(video_paths=None, clahe=True, model_type="default
     import pandas as pd
     from datetime import datetime
     import os
+    import gc
 
     def _build_polo_pipeline(polo_cfg):
         """Build a bb_pipeline Pipeline using PoloLocalizer instead of Localizer.
@@ -657,6 +658,12 @@ def job_for_process_rpi_videos(video_paths=None, clahe=True, model_type="default
         dirpath, basename = os.path.split(videofile)
         savename = basename.replace(".h264", f"{suffix}.parquet")
         df.to_parquet(os.path.join(dirpath, savename))
+
+        # Release per-video memory so RSS doesn't accumulate across a bundled chunk.
+        # Bundling many videos/task pushed peak RSS toward the 2G cap (a few OOMs);
+        # paired with MALLOC_ARENA_MAX=2 in the rpi Slurm exports.
+        del df
+        gc.collect()
 
     return True
 
