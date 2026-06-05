@@ -7,7 +7,7 @@ from bb_hpc import settings
 from slurmhelper import SLURMJob
 
 from bb_hpc.src.generate import generate_jobs_tracking
-from bb_hpc.src.jobfunctions import job_for_tracking
+from bb_hpc.src.jobfunctions import job_for_tracking_chunk
 from bb_hpc.src.slurm_utils import resolve_slurm_config, apply_slurm_to_job, run_jobs_and_log
 
 
@@ -46,22 +46,27 @@ def main():
         print("Nothing to do.")
         return
 
-    # Flatten to kwargs list for SLURMJob; matches job_for_tracking(**kwargs)
-    job_args = []
-    for batch in batches:
-        for it in batch.get("job_args_list", []):
-            job_args.append(dict(it))
+    # Keep each batch intact: one SLURM task processes a whole chunk of up to
+    # chunk_size hourly windows via job_for_tracking_chunk(job_args_list=[...]).
+    # (Do NOT flatten here — flattening produces one task per hour and makes
+    # chunk_size a no-op.)
+    job_args = [dict(b) for b in batches if b.get("job_args_list")]
 
     if not job_args:
         print("No shard args produced by generate_jobs_tracking.")
         return
+
+    total_windows = sum(len(b["job_args_list"]) for b in job_args)
+    print(f"[tracking_submit] {len(job_args)} SLURM tasks, "
+          f"{total_windows} hourly windows total "
+          f"(~{total_windows / max(len(job_args), 1):.1f} windows/task).")
 
     # Configure SLURM job
     job = SLURMJob(
         name=s_trk.get("jobname", "tracking"),
         job_root=settings.jobdir_hpc,
     )
-    job.set_job_fun(job_for_tracking)
+    job.set_job_fun(job_for_tracking_chunk)
     job.set_job_arguments(job_args)
     apply_slurm_to_job(job, slurm_cfg) # Apply the merged config
 

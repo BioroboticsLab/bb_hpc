@@ -307,63 +307,88 @@ def job_for_save_detect_chunk(job_args_list):
 #################################################################
 ##### TRACKING
 #################################################################
-def job_for_tracking(repo_path, save_path, temp_path, from_dt, to_dt, cam_id):
-    import bb_tracking.models, bb_tracking.features
-    import bb_tracking.repository_tracker
-    import os
-    import dill
-    import shutil
+def job_for_tracking_chunk(job_args_list):
+    """Process a list of one-hour tracking windows in a single SLURM task.
 
-    # use the same file-name generating function used by bb_binary
-    from bb_binary.parsing import get_video_fname
+    Each element of job_args_list is the kwargs dict for one hourly window
+    (repo_path, save_path, temp_path, from_dt, to_dt, cam_id). slurmhelper embeds
+    ONLY this function's source into the worker script, so the per-window logic
+    is defined inline as _track_one to keep this fully self-contained (no reliance
+    on bb_hpc being importable in the worker).
+    """
+    def _track_one(repo_path, save_path, temp_path, from_dt, to_dt, cam_id):
+        import bb_tracking.models, bb_tracking.features
+        import bb_tracking.repository_tracker
+        import os
+        import dill
+        import shutil
 
-    # ---- Compatibility patch for legacy repos with duplicate segments (no symlinks) ----
-    # For newer repos this is a no-op (timestamps are already monotonic).
-    try:
-        import bb_tracking.data_walker as _dw
-        _orig_iterate = getattr(_dw, "iterate_bb_binary_repository", None)
-    except Exception:
-        _orig_iterate = None
+        # use the same file-name generating function used by bb_binary
+        from bb_binary.parsing import get_video_fname
 
-    if _orig_iterate is not None:
-        from pathlib import Path
-        import numpy as _np
-        import datetime as _dt
-        import pytz as _pytz
+        # ---- Compatibility patch for legacy repos with duplicate segments (no symlinks) ----
+        # For newer repos this is a no-op (timestamps are already monotonic).
+        try:
+            import bb_tracking.data_walker as _dw
+            _orig_iterate = getattr(_dw, "iterate_bb_binary_repository", None)
+        except Exception:
+            _orig_iterate = None
 
-        def _iter_wrap(repository_path, dt_begin, dt_end, homography_fn=None, **kwargs):
-            """
-            Wrap the original iterator:
-            - De-dup frame containers by (cam_id, first_ts, last_ts)
-            - Enforce per-camera strictly increasing frame timestamps (skip non-increasing)
-            This safely handles legacy/tape repos where bucket-edge copies exist as real files.
-            """
-            # Call through to the original generator (note: homography_fn is positional)
-            gen = _orig_iterate(repository_path, dt_begin, dt_end, homography_fn, **kwargs)
+        if _orig_iterate is not None:
+            from pathlib import Path
+            import numpy as _np
+            import datetime as _dt
+            import pytz as _pytz
 
-            last_ts_by_cam = {}
-            seen_containers = set()
+            def _iter_wrap(repository_path, dt_begin, dt_end, homography_fn=None, **kwargs):
+                """
+                Wrap the original iterator:
+                - De-dup frame containers by (cam_id, first_ts, last_ts)
+                - Enforce per-camera strictly increasing frame timestamps (skip non-increasing)
+                This safely handles legacy/tape repos where bucket-edge copies exist as real files.
+                """
+                # Call through to the original generator (note: homography_fn is positional)
+                gen = _orig_iterate(repository_path, dt_begin, dt_end, homography_fn, **kwargs)
 
-            def _emit_with_guard(cam_id, frames_buf):
-                nonlocal last_ts_by_cam
-                for (frame_id, frame_dt, frame_detections, frame_kdtree) in frames_buf:
-                    ts = frame_dt.timestamp()
-                    last = last_ts_by_cam.get(cam_id)
-                    if (last is not None) and (ts <= last):
-                        continue
-                    last_ts_by_cam[cam_id] = ts
-                    yield (cam_id, frame_id, frame_dt, frame_detections, frame_kdtree)
+                last_ts_by_cam = {}
+                seen_containers = set()
 
-            try:
-                buffered = []
-                prev_cam = None
-                prev_frame_id = None
+                def _emit_with_guard(cam_id, frames_buf):
+                    nonlocal last_ts_by_cam
+                    for (frame_id, frame_dt, frame_detections, frame_kdtree) in frames_buf:
+                        ts = frame_dt.timestamp()
+                        last = last_ts_by_cam.get(cam_id)
+                        if (last is not None) and (ts <= last):
+                            continue
+                        last_ts_by_cam[cam_id] = ts
+                        yield (cam_id, frame_id, frame_dt, frame_detections, frame_kdtree)
 
-                while True:
-                    try:
-                        cam_id_it, frame_id, frame_dt, frame_detections, frame_kdtree = next(gen)
-                    except StopIteration:
-                        if buffered:
+                try:
+                    buffered = []
+                    prev_cam = None
+                    prev_frame_id = None
+
+                    while True:
+                        try:
+                            cam_id_it, frame_id, frame_dt, frame_detections, frame_kdtree = next(gen)
+                        except StopIteration:
+                            if buffered:
+                                first_ts = buffered[0][1].timestamp()
+                                last_ts  = buffered[-1][1].timestamp()
+                                key = (prev_cam, first_ts, last_ts)
+                                if key not in seen_containers:
+                                    seen_containers.add(key)
+                                    for out in _emit_with_guard(prev_cam, buffered):
+                                        yield out
+                            break
+
+                        new_container = (
+                            prev_cam is None
+                            or cam_id_it != prev_cam
+                            or (prev_frame_id is not None and frame_id < prev_frame_id)
+                        )
+
+                        if new_container and buffered:
                             first_ts = buffered[0][1].timestamp()
                             last_ts  = buffered[-1][1].timestamp()
                             key = (prev_cam, first_ts, last_ts)
@@ -371,197 +396,213 @@ def job_for_tracking(repo_path, save_path, temp_path, from_dt, to_dt, cam_id):
                                 seen_containers.add(key)
                                 for out in _emit_with_guard(prev_cam, buffered):
                                     yield out
-                        break
+                            buffered = []
 
-                    new_container = (
-                        prev_cam is None
-                        or cam_id_it != prev_cam
-                        or (prev_frame_id is not None and frame_id < prev_frame_id)
-                    )
+                        buffered.append((frame_id, frame_dt, frame_detections, frame_kdtree))
+                        prev_cam = cam_id_it
+                        prev_frame_id = frame_id
 
-                    if new_container and buffered:
-                        first_ts = buffered[0][1].timestamp()
-                        last_ts  = buffered[-1][1].timestamp()
-                        key = (prev_cam, first_ts, last_ts)
-                        if key not in seen_containers:
-                            seen_containers.add(key)
-                            for out in _emit_with_guard(prev_cam, buffered):
-                                yield out
-                        buffered = []
-
-                    buffered.append((frame_id, frame_dt, frame_detections, frame_kdtree))
-                    prev_cam = cam_id_it
-                    prev_frame_id = frame_id
-
-            except Exception:
-                # Fallback: pass-through with per-frame monotonic guard
-                last_ts_by_cam = {}
-                try:
-                    gen2 = _orig_iterate(repository_path, dt_begin, dt_end, homography_fn, **kwargs)
-                    for cam_id_it, frame_id, frame_dt, frame_detections, frame_kdtree in gen2:
-                        ts = frame_dt.timestamp()
-                        last = last_ts_by_cam.get(cam_id_it)
-                        if (last is not None) and (ts <= last):
-                            continue
-                        last_ts_by_cam[cam_id_it] = ts
-                        yield (cam_id_it, frame_id, frame_dt, frame_detections, frame_kdtree)
                 except Exception:
-                    # Last resort: yield original without changes
-                    gen3 = _orig_iterate(repository_path, dt_begin, dt_end, homography_fn, **kwargs)
-                    for item in gen3:
-                        yield item
+                    # Fallback: pass-through with per-frame monotonic guard
+                    last_ts_by_cam = {}
+                    try:
+                        gen2 = _orig_iterate(repository_path, dt_begin, dt_end, homography_fn, **kwargs)
+                        for cam_id_it, frame_id, frame_dt, frame_detections, frame_kdtree in gen2:
+                            ts = frame_dt.timestamp()
+                            last = last_ts_by_cam.get(cam_id_it)
+                            if (last is not None) and (ts <= last):
+                                continue
+                            last_ts_by_cam[cam_id_it] = ts
+                            yield (cam_id_it, frame_id, frame_dt, frame_detections, frame_kdtree)
+                    except Exception:
+                        # Last resort: yield original without changes
+                        gen3 = _orig_iterate(repository_path, dt_begin, dt_end, homography_fn, **kwargs)
+                        for item in gen3:
+                            yield item
 
-        # Monkey-patch
-        _dw.iterate_bb_binary_repository = _iter_wrap
-    # ---- end compatibility patch ----
+            # Monkey-patch
+            _dw.iterate_bb_binary_repository = _iter_wrap
+        # ---- end compatibility patch ----
 
-    # ---- Empty-frame compatibility patch for scipy.cKDTree ----
-    # bb_tracking.data_walker.iterate_bb_binary_repository calls
-    # scipy.spatial.cKDTree(xy) unconditionally. When a frame has zero
-    # detections (briefly obscured hive, lid event, etc.) xy is empty and
-    # cKDTree raises ValueError, which terminates the generator. Replace
-    # with an empty-tree-aware wrapper so the frame is still yielded but
-    # contains no neighbors. Scoped via try/finally further below so the
-    # patch is restored when this function returns.
-    import numpy as _np_ckdtree
-    import scipy.spatial as _sp_spatial
-    _orig_ckdtree = _sp_spatial.cKDTree
-    def _ckdtree_empty_safe(data, *a, **kw):
-        try:
-            n = len(data)
-        except TypeError:
-            n = -1
-        if n == 0:
-            return _orig_ckdtree(_np_ckdtree.empty((0, 2)), *a, **kw)
-        return _orig_ckdtree(data, *a, **kw)
-    _sp_spatial.cKDTree = _ckdtree_empty_safe
-    # ---- end empty-frame patch ----
+        # ---- Empty-frame compatibility patch for scipy.cKDTree ----
+        # bb_tracking.data_walker.iterate_bb_binary_repository calls
+        # scipy.spatial.cKDTree(xy) unconditionally. When a frame has zero
+        # detections (briefly obscured hive, lid event, etc.) xy is empty and
+        # cKDTree raises ValueError, which terminates the generator. Replace
+        # with an empty-tree-aware wrapper so the frame is still yielded but
+        # contains no neighbors. Scoped via try/finally further below so the
+        # patch is restored when this function returns.
+        import numpy as _np_ckdtree
+        import scipy.spatial as _sp_spatial
+        _orig_ckdtree = _sp_spatial.cKDTree
+        def _ckdtree_empty_safe(data, *a, **kw):
+            try:
+                n = len(data)
+            except TypeError:
+                n = -1
+            if n == 0:
+                return _orig_ckdtree(_np_ckdtree.empty((0, 2)), *a, **kw)
+            return _orig_ckdtree(data, *a, **kw)
+        _sp_spatial.cKDTree = _ckdtree_empty_safe
+        # ---- end empty-frame patch ----
 
-    output_filename_tmp = os.path.join(temp_path,get_video_fname(cam_id, from_dt, to_dt)+'.dill.tmp')
-    output_filename = os.path.join(save_path,get_video_fname(cam_id, from_dt, to_dt)+'.dill')
+        output_filename_tmp = os.path.join(temp_path,get_video_fname(cam_id, from_dt, to_dt)+'.dill.tmp')
+        output_filename = os.path.join(save_path,get_video_fname(cam_id, from_dt, to_dt)+'.dill')
 
-    # these thresholds are the same as David used:  0.6 and 0.5
-    detection_classification_threshold = 0.6
-    tracklet_classification_threshold = 0.5
+        # these thresholds are the same as David used:  0.6 and 0.5
+        detection_classification_threshold = 0.6
+        tracklet_classification_threshold = 0.5
 
-    model_dir = os.getenv('CONDA_PREFIX') + '/pipeline_models'
-    detection_model_path = os.path.join(model_dir, 'detection_model_4.json')
-    tracklet_model_path = os.path.join(model_dir,'tracklet_model_8.json')
-    detection_model = bb_tracking.models.load_xgb_model(detection_model_path)
-    tracklet_model = bb_tracking.models.load_xgb_model(tracklet_model_path)
+        model_dir = os.getenv('CONDA_PREFIX') + '/pipeline_models'
+        detection_model_path = os.path.join(model_dir, 'detection_model_4.json')
+        tracklet_model_path = os.path.join(model_dir,'tracklet_model_8.json')
+        detection_model = bb_tracking.models.load_xgb_model(detection_model_path)
+        tracklet_model = bb_tracking.models.load_xgb_model(tracklet_model_path)
 
-    px_per_cm_approx = 4833/43.2  # convert previously used thresholds to pixels, because now not applying the homography in the first step
+        px_per_cm_approx = 4833/43.2  # convert previously used thresholds to pixels, because now not applying the homography in the first step
 
-    detection_kwargs = dict(
-        max_distance_per_second = 30.0*px_per_cm_approx,
-        n_features=18,
-        detection_feature_fn=bb_tracking.features.get_detection_features,
-        detection_cost_fn=lambda features: 1 - detection_model.predict_proba(features)[:, 1],
-        max_cost=1.0 - detection_classification_threshold
-        )
+        detection_kwargs = dict(
+            max_distance_per_second = 30.0*px_per_cm_approx,
+            n_features=18,
+            detection_feature_fn=bb_tracking.features.get_detection_features,
+            detection_cost_fn=lambda features: 1 - detection_model.predict_proba(features)[:, 1],
+            max_cost=1.0 - detection_classification_threshold
+            )
 
-    tracklet_kwargs = dict(
-        max_distance_per_second = 20.0*px_per_cm_approx,
-        n_features=14,
-        max_seconds_gap=4.0,
-        tracklet_feature_fn=bb_tracking.features.get_track_features,
-        tracklet_cost_fn=lambda features: 1 - tracklet_model.predict_proba(features)[:, 1],
-        max_cost=1.0 - tracklet_classification_threshold
-        )
+        tracklet_kwargs = dict(
+            max_distance_per_second = 20.0*px_per_cm_approx,
+            n_features=14,
+            max_seconds_gap=4.0,
+            tracklet_feature_fn=bb_tracking.features.get_track_features,
+            tracklet_cost_fn=lambda features: 1 - tracklet_model.predict_proba(features)[:, 1],
+            max_cost=1.0 - tracklet_classification_threshold
+            )
 
-    tracker = bb_tracking.repository_tracker.RepositoryTracker(repo_path,
-                                                                    dt_begin=from_dt, dt_end=to_dt,
-                                                                      cam_ids=(cam_id,),
-                                                                      tracklet_kwargs=detection_kwargs,
-                                                                      track_kwargs=tracklet_kwargs,
-                                                                      repo_kwargs=dict(only_tagged_bees=True, fix_negative_timestamps=True),
-                                                                      progress_bar=None, use_threading=False)
+        tracker = bb_tracking.repository_tracker.RepositoryTracker(repo_path,
+                                                                        dt_begin=from_dt, dt_end=to_dt,
+                                                                          cam_ids=(cam_id,),
+                                                                          tracklet_kwargs=detection_kwargs,
+                                                                          track_kwargs=tracklet_kwargs,
+                                                                          repo_kwargs=dict(only_tagged_bees=True, fix_negative_timestamps=True),
+                                                                          progress_bar=None, use_threading=False)
      
-    # open the output file and write as results are generated
-    def process_track(track, cam_id, results_file):
-        batch = []
-        for det in track.detections:
-            batch.append((det.timestamp,
-                          det.frame_id,
-                          track.id,
-                          det.x_pixels, det.y_pixels, det.orientation_pixels,
-                          det.detection_index, det.detection_type.value,
-                          cam_id, track.bee_id, track.bee_id_confidence))
+        # open the output file and write as results are generated
+        def process_track(track, cam_id, results_file):
+            batch = []
+            for det in track.detections:
+                batch.append((det.timestamp,
+                              det.frame_id,
+                              track.id,
+                              det.x_pixels, det.y_pixels, det.orientation_pixels,
+                              det.detection_index, det.detection_type.value,
+                              cam_id, track.bee_id, track.bee_id_confidence))
         
-        # Incrementally save the results batch into the .dill file
-        dill.dump(batch, results_file)
+            # Incrementally save the results batch into the .dill file
+            dill.dump(batch, results_file)
 
-    success = False
-    had_iterator_error = False
-    had_track_error = False
-    tracks_written = 0
-    try:
-        with open(output_filename_tmp, "wb") as results_file:
-            tracker_iter = iter(tracker)
-            track = None
-
-            while True:
-                try:
-                    track = next(tracker_iter)
-                except StopIteration:
-                    print('reached the end')
-                    success = True
-                    break
-                except MemoryError:
-                    raise
-                except Exception as e:
-                    had_iterator_error = True
-                    print(f"Error occurred while retrieving the next track: {e}")
-                    import traceback; traceback.print_exc()
-                    if hasattr(track, 'detections'):
-                        for det in track.detections[:5]:
-                            try:
-                                print("Det:",
-                                      getattr(det, "timestamp", None),
-                                      getattr(det, "frame_id", None),
-                                      getattr(det, "detection_index", None),
-                                      getattr(det, "x_pixels", None),
-                                      getattr(det, "y_pixels", None))
-                            except Exception:
-                                print("Det:<unprintable>")
-                    continue
-                try:
-                    process_track(track, cam_id, results_file)
-                    tracks_written += 1
-                except MemoryError:
-                    raise
-                except Exception as e:
-                    had_track_error = True
-                    print(f"Error processing track {track.id}: {e}")
-                    if hasattr(track, 'timestamps'):
-                        print(f"Timestamps: {track.timestamps}")
-                    continue
-    finally:
-        # Restore the original scipy.spatial.cKDTree so the patch does not
-        # leak to other jobs running in the same process.
-        _sp_spatial.cKDTree = _orig_ckdtree
-
-    try:
-        tmp_size = os.path.getsize(output_filename_tmp)
-    except OSError:
-        tmp_size = 0
-
-    if success and not had_iterator_error and tmp_size > 0:
-        shutil.move(output_filename_tmp, output_filename)
-        print(f"tracking done: tracks={tracks_written} had_track_error={had_track_error} -> {output_filename}")
-    else:
+        success = False
+        had_iterator_error = False
+        had_track_error = False
+        tracks_written = 0
         try:
-            os.remove(output_filename_tmp)
-        except Exception:
-            pass
-        print(
-            f"tracking FAILED: success={success} had_iterator_error={had_iterator_error} "
-            f"had_track_error={had_track_error} tracks={tracks_written} tmp_size={tmp_size}; "
-            f"tmp removed: {output_filename_tmp}"
-        )
+            with open(output_filename_tmp, "wb") as results_file:
+                tracker_iter = iter(tracker)
+                track = None
+
+                while True:
+                    try:
+                        track = next(tracker_iter)
+                    except StopIteration:
+                        print('reached the end')
+                        success = True
+                        break
+                    except MemoryError:
+                        raise
+                    except Exception as e:
+                        had_iterator_error = True
+                        print(f"Error occurred while retrieving the next track: {e}")
+                        import traceback; traceback.print_exc()
+                        if hasattr(track, 'detections'):
+                            for det in track.detections[:5]:
+                                try:
+                                    print("Det:",
+                                          getattr(det, "timestamp", None),
+                                          getattr(det, "frame_id", None),
+                                          getattr(det, "detection_index", None),
+                                          getattr(det, "x_pixels", None),
+                                          getattr(det, "y_pixels", None))
+                                except Exception:
+                                    print("Det:<unprintable>")
+                        continue
+                    try:
+                        process_track(track, cam_id, results_file)
+                        tracks_written += 1
+                    except MemoryError:
+                        raise
+                    except Exception as e:
+                        had_track_error = True
+                        print(f"Error processing track {track.id}: {e}")
+                        if hasattr(track, 'timestamps'):
+                            print(f"Timestamps: {track.timestamps}")
+                        continue
+        finally:
+            # Restore the original scipy.spatial.cKDTree so the patch does not
+            # leak to other jobs running in the same process.
+            _sp_spatial.cKDTree = _orig_ckdtree
+
+        try:
+            tmp_size = os.path.getsize(output_filename_tmp)
+        except OSError:
+            tmp_size = 0
+
+        if success and not had_iterator_error and tmp_size > 0:
+            shutil.move(output_filename_tmp, output_filename)
+            print(f"tracking done: tracks={tracks_written} had_track_error={had_track_error} -> {output_filename}")
+        else:
+            try:
+                os.remove(output_filename_tmp)
+            except Exception:
+                pass
+            print(
+                f"tracking FAILED: success={success} had_iterator_error={had_iterator_error} "
+                f"had_track_error={had_track_error} tracks={tracks_written} tmp_size={tmp_size}; "
+                f"tmp removed: {output_filename_tmp}"
+            )
+            import sys
+            sys.exit(1)
+
+    total = len(job_args_list)
+    failures = 0
+    for i, kw in enumerate(job_args_list, 1):
+        print(f"[tracking_chunk] window {i}/{total}: cam={kw.get('cam_id')} "
+              f"{kw.get('from_dt')} -> {kw.get('to_dt')}", flush=True)
+        try:
+            _track_one(**kw)
+        except SystemExit as e:
+            # _track_one calls sys.exit(1) on failure; contain it so one bad
+            # hour does not abort the remaining windows in this chunk.
+            if e.code not in (0, None):
+                failures += 1
+                print(f"[tracking_chunk] window {i}/{total} FAILED (exit {e.code})", flush=True)
+        except Exception as e:
+            failures += 1
+            import traceback; traceback.print_exc()
+            print(f"[tracking_chunk] window {i}/{total} FAILED ({e})", flush=True)
+    print(f"[tracking_chunk] done: {total - failures}/{total} ok, {failures} failed", flush=True)
+    if failures:
         import sys
         sys.exit(1)
+    return True
 
+
+def job_for_tracking(repo_path, save_path, temp_path, from_dt, to_dt, cam_id):
+    """Track a single one-hour window. Thin wrapper around job_for_tracking_chunk so
+    existing direct callers (k8s run_tracking, bench harness) keep working unchanged.
+    """
+    return job_for_tracking_chunk([dict(
+        repo_path=repo_path, save_path=save_path, temp_path=temp_path,
+        from_dt=from_dt, to_dt=to_dt, cam_id=cam_id,
+    )])
 #################################################################
 ##### RPI - DETECT
 #################################################################
