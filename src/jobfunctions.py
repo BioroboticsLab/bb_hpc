@@ -709,3 +709,132 @@ def job_for_process_rpi_videos(video_paths=None, clahe=True, model_type="default
     return True
 
 
+#################################################################
+##### FRAME EXTRACT (cell-seg heavy preprocessing)
+#################################################################
+def job_for_frame_extract_chunk(work_units):
+    """Extract frames for a list of (date, camera) units in one SLURM task.
+
+    Each element of ``work_units`` is a self-contained dict produced by
+    generate_jobs_frame_extract (date, cam, video_root, frames_root, plus the
+    domain knobs). Imports are inline so slurmhelper can embed this function
+    standalone. Per-unit errors are contained so one bad camera does not abort
+    the rest of the chunk; the task exits nonzero if any unit failed.
+    """
+    import gc
+    from pathlib import Path
+
+    if not work_units:
+        return True
+
+    total = len(work_units)
+    failures = 0
+    for i, u in enumerate(work_units, 1):
+        date = u["date"]
+        cam = u["cam"]
+        print(f"[frame_extract_chunk] unit {i}/{total}: {date}/{cam}", flush=True)
+        try:
+            from frame_extractor.global_video_processor import GlobalVideoProcessor
+
+            out_dir = Path(u["frames_root"]) / date  # engine appends the cam-N subdir
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            decoder = u.get("decoder", "hevc_cuvid")
+            if isinstance(decoder, str) and decoder.lower() == "none":
+                decoder = None
+
+            proc = GlobalVideoProcessor(
+                base_dir=Path(u["video_root"]),
+                out_dir=out_dir,
+                file_format=u.get("file_format", "png"),
+                interval_in_sec=u.get("interval_in_sec", 60),
+                max_workers=u.get("max_workers", 2),
+                fps=u.get("fps", 3),
+                dates=[date],
+                cams=[cam],
+                decoder=decoder,
+            )
+            proc.run()
+        except Exception as e:
+            failures += 1
+            import traceback
+            traceback.print_exc()
+            print(f"[frame_extract_chunk] unit {i}/{total} FAILED ({e})", flush=True)
+        finally:
+            gc.collect()
+
+    print(f"[frame_extract_chunk] done: {total - failures}/{total} ok, {failures} failed", flush=True)
+    if failures:
+        import sys
+        sys.exit(1)
+    return True
+
+
+#################################################################
+##### BACKGROUND (cell-seg heavy preprocessing)
+#################################################################
+def job_for_background_chunk(work_units):
+    """Generate background images for a list of (date, camera) units in one task.
+
+    Each element of ``work_units`` is a self-contained dict produced by
+    generate_jobs_background. Imports are inline (slurmhelper-safe). The
+    segmentation model loads once per BackgroundImageGenerator construction, so
+    bundling a few cameras per task amortizes that cost. Per-unit errors are
+    contained; the task exits nonzero if any unit failed.
+    """
+    import gc
+    from pathlib import Path
+
+    if not work_units:
+        return True
+
+    total = len(work_units)
+    failures = 0
+    for i, u in enumerate(work_units, 1):
+        date = u["date"]
+        cam = u["cam"]
+        print(f"[background_chunk] unit {i}/{total}: {date}/{cam}", flush=True)
+        try:
+            from background_generator.background_img_generator import BackgroundImageGenerator
+            from background_generator.utils import BgImageGenConfig
+
+            source_path = Path(u["frames_root"]) / date        # contains cam-N frame dirs
+            output_path = Path(u["backgrounds_root"]) / date   # generator adds cam/<config-tag>
+            output_path.mkdir(parents=True, exist_ok=True)
+
+            config = BgImageGenConfig(
+                window_size=u.get("window_size", 10),
+                num_median_images=u.get("num_median_images", 200),
+                max_cycles=u.get("max_cycles", None),
+                jump_size_from_last=u.get("jump_size", 1),
+                apply_clahe=u.get("apply_clahe", "post"),
+                mask_dilation=u.get("mask_dilation", 15),
+                median_computation=u.get("median_computation", "cupy"),
+                device=u.get("device", "cuda"),
+                frame_interval_sec=u.get("frame_interval_sec", None),
+                background_window=u.get("background_window", None),
+                memmap_dir=u.get("memmap_dir", None),
+            )
+
+            generator = BackgroundImageGenerator(
+                source_path=source_path,
+                output_path=output_path,
+                config=config,
+                cams=[cam],
+            )
+            generator.run()
+        except Exception as e:
+            failures += 1
+            import traceback
+            traceback.print_exc()
+            print(f"[background_chunk] unit {i}/{total} FAILED ({e})", flush=True)
+        finally:
+            gc.collect()
+
+    print(f"[background_chunk] done: {total - failures}/{total} ok, {failures} failed", flush=True)
+    if failures:
+        import sys
+        sys.exit(1)
+    return True
+
+

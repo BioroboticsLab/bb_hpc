@@ -13,6 +13,9 @@ pipeline_root_local = '/path/to/your/pipeline_repo/'
 resultdir_local     = '/path/to/your/results/'
 jobdir_local        = '/path/to/your/jobs/'
 pi_videodir_local   = '/path/to/your/pi_videos/'
+# cell-seg heavy-preprocessing outputs
+frames_dir_local      = '/path/to/your/results/data_extracted_frames/'
+backgrounds_dir_local = '/path/to/your/results/data_backgrounds/'
 
 # HPC / cluster (Slurm or K8s or docker nodes)
 bb_hpc_dir_hpc    = "/path/to/your/bb_hpc/"
@@ -21,6 +24,9 @@ pipeline_root_hpc = '/path/to/your/pipeline_repo/'
 resultdir_hpc     = '/path/to/your/results/'
 jobdir_hpc        = '/path/to/your/jobs/'
 pi_videodir_hpc   = '/path/to/your/pi_videos/'
+# cell-seg heavy-preprocessing outputs
+frames_dir_hpc      = '/path/to/your/results/data_extracted_frames/'
+backgrounds_dir_hpc = '/path/to/your/results/data_backgrounds/'
 
 ## detect
 detect_settings = {
@@ -70,6 +76,51 @@ rpi_detect_settings = {
     "use_clahe": True,        # True -> "-c"; False -> "-nc"
 }
 
+## frame extraction (cell-seg heavy preprocessing)
+# Work unit = (date, camera). Re-running at a coarser interval that is a
+# multiple of a finer completed run schedules ~nothing (per-filename skip).
+frame_extract_settings = {
+    "jobname": "frame_extract",
+    "chunk_size": 4,              # (date, cam) units per array task
+    "jobtime_minutes": 600,      # tune with: slurm_report --name frame_extract
+    "maxjobs": None,
+    # domain knobs forwarded to GlobalVideoProcessor:
+    "interval_in_sec": 60,       # seconds between extracted frames
+    "fps": 3,
+    "file_format": "png",
+    "max_workers": 2,
+    "decoder": "hevc_cuvid",     # NVIDIA NVDEC; use None/"none" for software decode
+    "slurm": {
+        "max_memory": "8GB",
+        "gres": "gpu:1",         # NVDEC needs a GPU; drop if using software decode
+    },
+}
+
+## background generation (cell-seg heavy preprocessing)
+# Runs after frame extraction for the same (date, cam). Output paths encode the
+# interval/window config so different configs are distinct, comparable products.
+background_settings = {
+    "jobname": "background",
+    "chunk_size": 2,
+    "jobtime_minutes": 600,      # tune with: slurm_report --name background
+    "maxjobs": None,
+    # domain knobs forwarded to BgImageGenConfig:
+    "frame_interval_sec": None,  # None = use every extracted frame
+    "background_window": None,   # None = count-based; or "hour" / "day" / <seconds>
+    "window_size": 10,
+    "num_median_images": 200,
+    "max_cycles": None,
+    "jump_size": 1,
+    "apply_clahe": "post",
+    "mask_dilation": 15,
+    "median_computation": "cupy",  # "masked_array" for CPU-only
+    "device": "cuda",              # "cpu" for CPU-only
+    "slurm": {
+        "max_memory": "16GB",
+        "gres": "gpu:1",
+    },
+}
+
 # Camera-to-model mapping for RPi detection (optional).
 # Keys are cam_id prefixes (matched with str.startswith, first match wins).
 # Unmatched cam_ids fall back to "default" (standard heatmap localizer).
@@ -110,6 +161,8 @@ k8s = {
     "runner_path": os.path.join(bb_hpc_dir_hpc, "running_k8s/run_videos.py"),
     "save_detect_runner_path": os.path.join(bb_hpc_dir_hpc, "running_k8s/run_save_detect.py"),
     "tracking_runner_path": os.path.join(bb_hpc_dir_hpc, "running_k8s/run_tracking.py"),
+    "frame_extract_runner_path": os.path.join(bb_hpc_dir_hpc, "running_k8s/run_frame_extract.py"),
+    "background_runner_path": os.path.join(bb_hpc_dir_hpc, "running_k8s/run_background.py"),
 
     "job": {
         "parallelism": 4,

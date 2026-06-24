@@ -33,11 +33,14 @@ WORKDIR /workspace
 RUN micromamba run -n combbg poetry --version && \
     micromamba run -n combbg poetry config virtualenvs.create false
 
-# Clone and install the background generator into the combbg env
-RUN git clone --depth=1 https://github.com/danielsturm/honeybee_cell_segmentation_pipeline.git && \
+# Clone and install the cell-seg heavy tools (frame extractor + background generator).
+# install.py background-generator installs honeybee_segmentor + frame_extractor +
+# background_generator (editable) from the new heavy_preprocessing/ layout.
+ARG CELLSEG_REPO_URL=https://github.com/BioroboticsLab/honeybee_cell_segmentation_pipeline.git
+RUN git clone --depth=1 "$CELLSEG_REPO_URL" honeybee_cell_segmentation_pipeline && \
     micromamba run -n combbg bash -lc '\
-      cd honeybee_cell_segmentation_pipeline/background_img_generator && \
-      poetry install --no-interaction --no-ansi && \
+      cd honeybee_cell_segmentation_pipeline && \
+      python install.py background-generator && \
       # Ensure CUDA-enabled Torch in this env (for segmentation-models-pytorch)
       python -m pip install --index-url https://download.pytorch.org/whl/cu126 \
           torch torchvision torchaudio \
@@ -51,17 +54,11 @@ print('CUDA available:', torch.cuda.is_available())
 sys.exit(0)
 PY
 
-# Symlink ffmpeg for the frame extractor expected path
-RUN bash -lc '\
-  cd honeybee_cell_segmentation_pipeline/background_img_generator && \
-  mkdir -p frame_extractor/bin && \
-  if command -v ffmpeg >/dev/null 2>&1; then \
-      ln -sf "$(command -v ffmpeg)" frame_extractor/bin/ffmpeg; \
-      echo "Symlinked ffmpeg"; \
-  else \
-      echo "WARNING: ffmpeg not found"; \
-  fi \
-'
+# The frame extractor finds ffmpeg on PATH automatically (determine_ffmpeg_bin_path).
+# NOTE: the apt ffmpeg may lack NVDEC (hevc_cuvid). For GPU decode supply a
+# CUDA-enabled ffmpeg on PATH; otherwise run extraction with software decode
+# (decoder=None / --decoder none).
+RUN bash -lc 'command -v ffmpeg && echo "ffmpeg available on PATH" || echo "WARNING: ffmpeg not found"'
 
 CMD ["/bin/bash"]
 ###############################################################################
@@ -112,11 +109,14 @@ RUN set -euo pipefail && \
     poetry --version && \
     poetry config virtualenvs.create false
 
-# Clone and install the background generator into the combbg env
+# Clone and install the cell-seg heavy tools (frame extractor + background generator).
+# install.py background-generator installs honeybee_segmentor + frame_extractor +
+# background_generator (editable) from the new heavy_preprocessing/ layout.
+ARG CELLSEG_REPO_URL=https://github.com/BioroboticsLab/honeybee_cell_segmentation_pipeline.git
 RUN set -euo pipefail && \
-    git clone --depth=1 https://github.com/danielsturm/honeybee_cell_segmentation_pipeline.git && \
-    cd honeybee_cell_segmentation_pipeline/background_img_generator && \
-    poetry install --no-interaction --no-ansi && \
+    git clone --depth=1 "$CELLSEG_REPO_URL" honeybee_cell_segmentation_pipeline && \
+    cd honeybee_cell_segmentation_pipeline && \
+    python install.py background-generator && \
     # Ensure CUDA-enabled Torch in this env (for segmentation-models-pytorch)
     python -m pip install --index-url https://download.pytorch.org/whl/cu126 \
         torch torchvision torchaudio
@@ -129,15 +129,10 @@ print('CUDA available:', torch.cuda.is_available())
 sys.exit(0)
 PY
 
-# Symlink ffmpeg for the frame extractor expected path
-RUN set -euo pipefail && \
-  cd honeybee_cell_segmentation_pipeline/background_img_generator && \
-  mkdir -p frame_extractor/bin && \
-  if command -v ffmpeg >/dev/null 2>&1; then \
-      ln -sf "$(command -v ffmpeg)" frame_extractor/bin/ffmpeg; \
-      echo "Symlinked ffmpeg"; \
-  else \
-      echo "WARNING: ffmpeg not found"; \
-  fi
+# The frame extractor finds ffmpeg on PATH automatically (determine_ffmpeg_bin_path).
+# NOTE: the apt ffmpeg may lack NVDEC (hevc_cuvid). For GPU decode supply a
+# CUDA-enabled ffmpeg on PATH; otherwise run extraction with software decode
+# (decoder=None / --decoder none).
+RUN set -euo pipefail && (command -v ffmpeg && echo "ffmpeg available on PATH" || echo "WARNING: ffmpeg not found")
 
 CMD ["/bin/bash"]

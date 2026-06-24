@@ -155,6 +155,63 @@ All Docker scripts support `--dry-run`.
 
 ---
 
+## 3b. Cell-seg heavy preprocessing (frame extraction + background generation)
+
+Two GPU stages that wrap the heavy "do-once-first" steps of the
+[honeybee_cell_segmentation_pipeline](https://github.com/BioroboticsLab/honeybee_cell_segmentation_pipeline)
+(`heavy_preprocessing/frame_extractor` and `heavy_preprocessing/background_generator`)
+so they scale across the cluster like detect/tracking. Run **frame extraction first**,
+then **background generation** for the same dates.
+
+**Prerequisite:** the cell-seg tools must be importable in the run environment.
+On SLURM this is the `beesbook` conda env (installed by
+`bb_main/code/install_update_beesbook_pipeline.sh`); on K8s/Docker use the
+`comb-background` image (`building_docker/Dockerfile-comb-background`).
+
+```bash
+# SLURM
+python -m bb_hpc.running_slurm.frame_extract_submit --dates 20250603 20250604
+python -m bb_hpc.running_slurm.background_submit    --dates 20250603 20250604
+
+# Kubernetes (GPU)
+python -m bb_hpc.running_k8s.frame_extract_submit --dates 20250603
+python -m bb_hpc.running_k8s.background_submit    --dates 20250603
+```
+
+Both accept `--dates` and `--dry-run`. Work is sharded by **(date, camera)**;
+`chunk_size` bundles several units per task. All parameters live in
+`settings.frame_extract_settings` / `settings.background_settings`:
+
+- **Frame extraction:** `interval_in_sec` (seconds between frames — the key
+  knob), `fps`, `file_format`, `max_workers`, `decoder` (`hevc_cuvid` for
+  NVIDIA NVDEC, or `None`/`"none"` for CPU software decode).
+- **Background generation:** `frame_interval_sec` (subsample frames, e.g. compare
+  5-min vs 10-min backgrounds), `background_window` (`"hour"`/`"day"`/seconds —
+  one background per window; `None` = count-based rolling mode), plus
+  `window_size`, `num_median_images`, `mask_dilation`, `median_computation`,
+  `device`, etc.
+
+**Skip / "what's left to do":** both stages skip already-done `(date, camera)`
+units by checking the **expected output filenames**. For extraction this means a
+coarser interval that is a multiple of a finished finer run schedules nothing
+(e.g. 10-min after 5-min). Backgrounds encode the interval/window config in the
+output path (`data_backgrounds/<date>/cam-N/<config-tag>/`), so different configs
+are distinct, comparable products and repeat configs skip. Use `--dry-run` to see
+the pending unit count before submitting.
+
+**Outputs:** `settings.frames_dir_*` (e.g. `results/data_extracted_frames/<date>/cam-N/`)
+and `settings.backgrounds_dir_*` (e.g. `results/data_backgrounds/<date>/cam-N/<config-tag>/`).
+
+**GPU note:** both stages request `gres=gpu:1`. Frame extraction's default
+`hevc_cuvid` needs NVDEC (a CUDA build of ffmpeg); on CPU-only nodes set
+`decoder=None` and drop the gres. Background generation needs a CUDA-12 runtime
+for `cupy-cuda12x` (or set `median_computation="masked_array"`, `device="cpu"`).
+
+Tune sizing after a first batch:
+`python -m bb_hpc.slurm_report --name frame_extract --target-walltime-min 480`.
+
+---
+
 ## 4. Additional Notes
 
 **Job directories:** Each submission creates a structured job directory with logs, outputs, and job definitions.
