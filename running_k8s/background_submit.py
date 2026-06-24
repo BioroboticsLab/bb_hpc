@@ -17,11 +17,22 @@ import re
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--dates", nargs="+", required=True,
-                   help="YYYYMMDD (one or many). Example: 20250603 20250604")
+    p.add_argument("--dates", nargs="+", default=None,
+                   help="YYYYMMDD (one or many), date mode. Example: 20250603 20250604")
+    p.add_argument("--source-dir", default=None,
+                   help="Explicit frames dir containing cam-N/ (no date level). Overrides --dates.")
+    p.add_argument("--label", default=None,
+                   help="Output sub-key under --out-dir for --source-dir mode (default: source dir name).")
+    p.add_argument("--out-dir", default=None,
+                   help="Output base for --source-dir mode (default: settings.backgrounds_dir_hpc).")
+    p.add_argument("--cams", nargs="+", default=None,
+                   help="Optional camera filter, e.g. --cams cam-0 cam-1.")
     p.add_argument("--dry-run", action="store_true",
                    help="Write filelists & Job spec, but do not kubectl apply.")
-    return p.parse_args()
+    args = p.parse_args()
+    if not args.source_dir and not args.dates:
+        p.error("one of --dates or --source-dir is required")
+    return args
 
 
 def _sanitize_job_name(name: str) -> str:
@@ -35,6 +46,8 @@ def _remap_unit_to_hpc(unit: dict) -> dict:
     out = dict(unit)
     out["frames_root"] = str(Path(settings.frames_dir_hpc))
     out["backgrounds_root"] = str(Path(settings.backgrounds_dir_hpc))
+    # In --source-dir mode the unit carries explicit source_path/output_path that
+    # the user passed as cluster-visible absolute paths; leave them as-is.
     return out
 
 
@@ -51,16 +64,15 @@ def make_indexed_job(job_name, completions, parallelism, filelist_dir_pod, runne
     k = settings.k8s
     env_list = [{"name": kk, "value": str(vv)} for kk, vv in k.get("env", {}).items()]
     resources = k.get("resources", {})  # GPU block (nvidia.com/gpu)
+    comb_env = k.get("comb_conda_env", "combbg")
 
     bash = f"""\
 set -euo pipefail
 
 if [ -f /opt/conda/etc/profile.d/conda.sh ]; then
   source /opt/conda/etc/profile.d/conda.sh
-else
-  eval "$(/opt/conda/bin/conda shell.bash hook)"
 fi
-conda activate beesbook || true
+conda activate {comb_env} || true
 
 idx="${{JOB_COMPLETION_INDEX:-0}}"
 printf -v idx5 "%05d" "$idx"
@@ -76,7 +88,7 @@ python -u {runner_path} "$fl"
         "imagePullSecrets": [{"name": k["image_pull_secret"]}],
         "containers": [{
             "name": "background",
-            "image": k["image"],
+            "image": k.get("image_comb", k["image"]),
             "command": ["bash", "-lc", bash],
             "resources": resources,
             "env": env_list,
@@ -135,6 +147,10 @@ def main():
         memmap_dir           = s.get("memmap_dir", None),
         chunk_size           = int(s.get("chunk_size", 2)),
         maxjobs              = s.get("maxjobs", None),
+        source_dir           = args.source_dir,
+        label                = args.label,
+        out_dir              = args.out_dir,
+        cams                 = args.cams,
     ))
     if not chunks:
         print("No background work to submit.")

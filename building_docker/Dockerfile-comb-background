@@ -37,7 +37,8 @@ RUN micromamba run -n combbg poetry --version && \
 # install.py background-generator installs honeybee_segmentor + frame_extractor +
 # background_generator (editable) from the new heavy_preprocessing/ layout.
 ARG CELLSEG_REPO_URL=https://github.com/BioroboticsLab/honeybee_cell_segmentation_pipeline.git
-RUN git clone --depth=1 "$CELLSEG_REPO_URL" honeybee_cell_segmentation_pipeline && \
+ARG CELLSEG_REPO_REF=bbhpc-integration
+RUN git clone --depth=1 --branch "$CELLSEG_REPO_REF" "$CELLSEG_REPO_URL" honeybee_cell_segmentation_pipeline && \
     micromamba run -n combbg bash -lc '\
       cd honeybee_cell_segmentation_pipeline && \
       python install.py background-generator && \
@@ -113,8 +114,9 @@ RUN set -euo pipefail && \
 # install.py background-generator installs honeybee_segmentor + frame_extractor +
 # background_generator (editable) from the new heavy_preprocessing/ layout.
 ARG CELLSEG_REPO_URL=https://github.com/BioroboticsLab/honeybee_cell_segmentation_pipeline.git
+ARG CELLSEG_REPO_REF=bbhpc-integration
 RUN set -euo pipefail && \
-    git clone --depth=1 "$CELLSEG_REPO_URL" honeybee_cell_segmentation_pipeline && \
+    git clone --depth=1 --branch "$CELLSEG_REPO_REF" "$CELLSEG_REPO_URL" honeybee_cell_segmentation_pipeline && \
     cd honeybee_cell_segmentation_pipeline && \
     python install.py background-generator && \
     # Ensure CUDA-enabled Torch in this env (for segmentation-models-pytorch)

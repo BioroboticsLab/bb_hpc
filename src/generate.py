@@ -709,7 +709,7 @@ def generate_jobs_frame_extract(
 def generate_jobs_background(
     frames_root_dir,        # e.g. settings.frames_dir_hpc
     backgrounds_root_dir,   # e.g. settings.backgrounds_dir_hpc
-    datestring,             # list of YYYYMMDD (or a single string)
+    datestring,             # list of YYYYMMDD (or a single string); ignored in source_dir mode
     frame_interval_sec=None,
     background_window=None,
     window_size=10,
@@ -724,13 +724,25 @@ def generate_jobs_background(
     chunk_size=2,
     maxjobs=None,
     verbose=False,
+    source_dir=None,        # explicit frames dir containing cam-N (NO date level)
+    label=None,             # output sub-key under the output base for source_dir mode
+    out_dir=None,           # explicit output base (defaults to backgrounds_root_dir)
+    cams=None,              # optional camera filter, e.g. ["cam-0", "cam-1"]
 ):
     """
-    Yield chunks of (date, camera) background-generation work units over cameras
-    whose extracted frames exist under ``frames_root/<date>/cam-N/``.
+    Yield chunks of (scope, camera) background-generation work units.
+
+    Two enumeration modes:
+      - Date mode (default): cameras under ``frames_root/<date>/cam-N/`` for each
+        date; output under ``backgrounds_root/<date>``.
+      - Explicit-dir mode (``source_dir`` set): cameras under ``source_dir/cam-N/``
+        directly (no date level -- e.g. bb_monitor's ``single_video_frames/``);
+        output under ``<out_dir or backgrounds_root>/<label>``. The matching
+        ``BackgroundImageGenerator`` auto-discovers the ``cam-N`` subdirs, so this
+        is its natural input.
 
     The output config tag (interval/window settings) is encoded in the output
-    path, so a (date, cam) is skipped when the backgrounds for THIS config
+    path, so a (scope, cam) is skipped when the backgrounds for THIS config
     already exist:
       - window mode: every expected per-window ``background_<wstart>.png`` exists
         (via ``background_generator.windowing.expected_background_names``)
@@ -738,7 +750,8 @@ def generate_jobs_background(
 
     Yields
     ------
-    dict: {"work_units": [ {date, cam, frames_root, backgrounds_root, <bg knobs>}, ... ]}
+    dict: {"work_units": [ {date, cam, frames_root, backgrounds_root, <bg knobs>,
+                            (source_path, output_path in explicit-dir mode)}, ... ]}
     """
     import os, glob
 
@@ -748,8 +761,6 @@ def generate_jobs_background(
         windowing = None
         print(f"[background] background_generator not importable ({e!r}); using presence-based skip")
 
-    days = list(datestring) if isinstance(datestring, (list, tuple)) else [datestring]
-
     if windowing is not None:
         tag = windowing.config_tag(frame_interval_sec, background_window, window_size, num_median_images)
     else:
@@ -757,63 +768,90 @@ def generate_jobs_background(
         tag = (f"int{interval}s_win{background_window}" if background_window
                else f"count_w{window_size}_n{num_median_images}_int{interval}s")
 
+    cam_filter = set(cams) if cams else None
+
+    def _knobs():
+        return {
+            "frame_interval_sec": frame_interval_sec,
+            "background_window": background_window,
+            "window_size": window_size,
+            "num_median_images": num_median_images,
+            "max_cycles": max_cycles,
+            "jump_size": jump_size,
+            "apply_clahe": apply_clahe,
+            "mask_dilation": mask_dilation,
+            "median_computation": median_computation,
+            "device": device,
+            "memmap_dir": memmap_dir,
+        }
+
+    def _is_done(out_cam_tag_dir, frame_names):
+        if background_window and windowing is not None:
+            expected = windowing.expected_background_names(frame_names, frame_interval_sec, background_window)
+            if not expected:
+                return False
+            existing = set(os.listdir(out_cam_tag_dir)) if os.path.isdir(out_cam_tag_dir) else set()
+            return expected.issubset(existing)
+        return os.path.isdir(out_cam_tag_dir) and any(
+            fn.startswith("background_") and fn.endswith(".png") for fn in os.listdir(out_cam_tag_dir)
+        )
+
+    # Each "scope" is (scan_dir, output_path, scope_id, explicit). One per date in
+    # date mode; a single scope (no date level) in explicit-dir mode.
+    if source_dir is not None:
+        out_base = out_dir or backgrounds_root_dir
+        lbl = label or os.path.basename(str(source_dir).rstrip("/")) or "frames"
+        scopes = [(str(source_dir), os.path.join(out_base, lbl), lbl, True)]
+        n_scopes = 1
+    else:
+        days = list(datestring) if isinstance(datestring, (list, tuple)) else [datestring]
+        scopes = [(os.path.join(frames_root_dir, d), os.path.join(backgrounds_root_dir, d), d, False)
+                  for d in days]
+        n_scopes = len(days)
+
     units = []
-    for date in days:
-        date_dir = os.path.join(frames_root_dir, date)
-        if not os.path.isdir(date_dir):
+    for scan_dir, output_path, scope_id, explicit in scopes:
+        if not os.path.isdir(scan_dir):
             if verbose:
-                print(f"[background] no frames for date: {date_dir}")
+                print(f"[background] no frames dir: {scan_dir}")
             continue
 
-        cam_dirs = sorted(d for d in glob.glob(os.path.join(date_dir, "cam-*")) if os.path.isdir(d))
+        cam_dirs = sorted(d for d in glob.glob(os.path.join(scan_dir, "cam-*")) if os.path.isdir(d))
         for cam_dir in cam_dirs:
             cam = os.path.basename(cam_dir)
+            if cam_filter is not None and cam not in cam_filter:
+                continue
             frame_names = [fn for fn in os.listdir(cam_dir) if fn.endswith(".png")]
             if not frame_names:
                 continue
 
-            out_dir = os.path.join(backgrounds_root_dir, date, cam, tag)
-
-            done = False
-            if background_window and windowing is not None:
-                expected = windowing.expected_background_names(frame_names, frame_interval_sec, background_window)
-                if expected:
-                    existing = set(os.listdir(out_dir)) if os.path.isdir(out_dir) else set()
-                    done = expected.issubset(existing)
-            else:
-                done = os.path.isdir(out_dir) and any(
-                    fn.startswith("background_") and fn.endswith(".png") for fn in os.listdir(out_dir)
-                )
-
-            if done:
+            out_cam_tag_dir = os.path.join(output_path, cam, tag)
+            if _is_done(out_cam_tag_dir, frame_names):
                 if verbose:
-                    print(f"[background] done: {date}/{cam} [{tag}]")
+                    print(f"[background] done: {scope_id}/{cam} [{tag}]")
                 continue
 
-            units.append({
-                "date": date,
+            unit = {
+                "date": scope_id,   # YYYYMMDD in date mode, label in explicit-dir mode
                 "cam": cam,
                 "frames_root": frames_root_dir,
                 "backgrounds_root": backgrounds_root_dir,
-                "frame_interval_sec": frame_interval_sec,
-                "background_window": background_window,
-                "window_size": window_size,
-                "num_median_images": num_median_images,
-                "max_cycles": max_cycles,
-                "jump_size": jump_size,
-                "apply_clahe": apply_clahe,
-                "mask_dilation": mask_dilation,
-                "median_computation": median_computation,
-                "device": device,
-                "memmap_dir": memmap_dir,
-            })
+            }
+            if explicit:
+                # Already-resolved cluster paths; job_for_background_chunk uses these
+                # verbatim instead of reconstructing frames_root/<date>.
+                unit["source_path"] = scan_dir
+                unit["output_path"] = output_path
+            unit.update(_knobs())
+            units.append(unit)
 
     units.sort(key=lambda u: (u["date"], u["cam"]))
     if maxjobs is not None:
         units = units[: int(chunk_size) * int(maxjobs)]
 
-    print(f"[background] dates={len(days)} units={len(units)} chunk_size={chunk_size} "
-          f"maxjobs={maxjobs} tag={tag}")
+    print(f"[background] scopes={n_scopes} units={len(units)} chunk_size={chunk_size} "
+          f"maxjobs={maxjobs} tag={tag}"
+          + (f" source_dir={source_dir}" if source_dir else ""))
 
     for i in range(0, len(units), int(chunk_size)):
         yield {"work_units": units[i:i + int(chunk_size)]}

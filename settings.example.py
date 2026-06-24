@@ -156,6 +156,10 @@ k8s = {
     "namespace": os.environ.get("K8S_NAMESPACE", "your-namespace"),
     "image_pull_secret": os.environ.get("K8S_IMAGE_PULL_SECRET", "your-image-pull-secret"),
     "image": os.environ.get("K8S_IMAGE", "your-registry.example.com/your-username/beesbook:latest"),
+    # cell-seg heavy preprocessing (frame_extract / background) image: combbg env
+    # with frame_extractor + background_generator + cupy (bbhpc-integration branch).
+    "image_comb": os.environ.get("K8S_IMAGE_COMB", "your-registry.example.com/your-username/comb-background:latest"),
+    "comb_conda_env": "combbg",
 
     # The runner script path **inside the cluster** (must exist in the pod via mounts or image)
     "runner_path": os.path.join(bb_hpc_dir_hpc, "running_k8s/run_videos.py"),
@@ -250,11 +254,17 @@ k8s = {
 docker = {
     # Reuse the same image & runner used in k8s
     "image": os.environ.get("DOCKER_IMAGE", "jacobdavidson/beesbook:latest"),
+    # cell-seg heavy preprocessing image (combbg conda env with frame_extractor +
+    # background_generator + cupy). Built from building_docker/Dockerfile-comb-background.
+    "image_comb": os.environ.get("DOCKER_IMAGE_COMB", "jacobdavidson/comb-background:latest"),
+    "comb_conda_env": "combbg",
     "runtime": "nvidia",
     "runner_path": os.path.join(bb_hpc_dir_hpc, "running_k8s/run_videos.py"),
     "runner_path_rpi": os.path.join(bb_hpc_dir_hpc, "running_k8s/run_rpi_videos.py"),
     "runner_path_save_detect": os.path.join(bb_hpc_dir_hpc, "running_k8s/run_save_detect.py"),
     "runner_path_tracking": os.path.join(bb_hpc_dir_hpc, "running_k8s/run_tracking.py"),
+    "runner_path_frame_extract": os.path.join(bb_hpc_dir_hpc, "running_k8s/run_frame_extract.py"),
+    "runner_path_background": os.path.join(bb_hpc_dir_hpc, "running_k8s/run_background.py"),
 
     # Bind mounts: list of (host_path, container_path) so the container sees HPC-style paths.
     # IMPORTANT: Make sure these cover:

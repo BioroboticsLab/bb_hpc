@@ -20,7 +20,15 @@ def parse_args():
 
     p = argparse.ArgumentParser(description="Submit cell-seg background-generation shards to SLURM")
     p.add_argument("--dates", nargs="+", default=[yesterday, today],
-                   help="YYYYMMDD strings (UTC). Default: yesterday & today.")
+                   help="YYYYMMDD strings (UTC), date mode. Default: yesterday & today.")
+    p.add_argument("--source-dir", default=None,
+                   help="Explicit frames dir containing cam-N/ (no date level). Overrides --dates.")
+    p.add_argument("--label", default=None,
+                   help="Output sub-key under --out-dir for --source-dir mode (default: source dir name).")
+    p.add_argument("--out-dir", default=None,
+                   help="Output base for --source-dir mode (default: settings.backgrounds_dir_hpc).")
+    p.add_argument("--cams", nargs="+", default=None,
+                   help="Optional camera filter, e.g. --cams cam-0 cam-1.")
     p.add_argument("--dry-run", action="store_true",
                    help="Build the work list + sbatch script only; do not submit.")
     return p.parse_args()
@@ -53,6 +61,10 @@ def main():
         chunk_size           = int(s.get("chunk_size", 2)),
         maxjobs              = s.get("maxjobs", None),
         verbose              = bool(args.dry_run),
+        source_dir           = args.source_dir,
+        label                = args.label,
+        out_dir              = args.out_dir,
+        cams                 = args.cams,
     ))
     if not chunks:
         print("No work to submit.")
@@ -72,7 +84,8 @@ def main():
         print(f"Dry run: {len(chunks)} task(s) staged; not submitting.")
         return
 
-    run_jobs_and_log(job, settings.jobdir_hpc, s.get("jobname", "background"), args.dates)
+    log_scope = [args.label or "source_dir"] if args.source_dir else args.dates
+    run_jobs_and_log(job, settings.jobdir_hpc, s.get("jobname", "background"), log_scope)
     print("[background_submit] Submitted.")
 
 

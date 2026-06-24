@@ -798,8 +798,14 @@ def job_for_background_chunk(work_units):
             from background_generator.background_img_generator import BackgroundImageGenerator
             from background_generator.utils import BgImageGenConfig
 
-            source_path = Path(u["frames_root"]) / date        # contains cam-N frame dirs
-            output_path = Path(u["backgrounds_root"]) / date   # generator adds cam/<config-tag>
+            # Explicit-dir mode (e.g. bb_monitor single_video_frames) carries the
+            # already-resolved cluster paths; date mode reconstructs them.
+            if u.get("source_path"):
+                source_path = Path(u["source_path"])           # contains cam-N frame dirs
+                output_path = Path(u["output_path"])           # generator adds cam/<config-tag>
+            else:
+                source_path = Path(u["frames_root"]) / date    # contains cam-N frame dirs
+                output_path = Path(u["backgrounds_root"]) / date  # generator adds cam/<config-tag>
             output_path.mkdir(parents=True, exist_ok=True)
 
             config = BgImageGenConfig(

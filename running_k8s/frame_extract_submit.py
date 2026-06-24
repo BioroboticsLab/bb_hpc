@@ -58,16 +58,15 @@ def make_indexed_job(job_name, completions, parallelism, filelist_dir_pod, runne
     k = settings.k8s
     env_list = [{"name": kk, "value": str(vv)} for kk, vv in k.get("env", {}).items()]
     resources = k.get("resources", {})  # GPU block (nvidia.com/gpu)
+    comb_env = k.get("comb_conda_env", "combbg")
 
     bash = f"""\
 set -euo pipefail
 
 if [ -f /opt/conda/etc/profile.d/conda.sh ]; then
   source /opt/conda/etc/profile.d/conda.sh
-else
-  eval "$(/opt/conda/bin/conda shell.bash hook)"
 fi
-conda activate beesbook || true
+conda activate {comb_env} || true
 
 idx="${{JOB_COMPLETION_INDEX:-0}}"
 printf -v idx5 "%05d" "$idx"
@@ -83,7 +82,7 @@ python -u {runner_path} "$fl"
         "imagePullSecrets": [{"name": k["image_pull_secret"]}],
         "containers": [{
             "name": "frame-extract",
-            "image": k["image"],
+            "image": k.get("image_comb", k["image"]),
             "command": ["bash", "-lc", bash],
             "resources": resources,
             "env": env_list,
