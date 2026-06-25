@@ -55,13 +55,19 @@ RUN set -euo pipefail && \
 # exists on bbhpc-integration -- a `main` build is missing the cams= argument.
 ARG CELLSEG_REPO_URL=https://github.com/BioroboticsLab/honeybee_cell_segmentation_pipeline.git
 ARG CELLSEG_REPO_REF=bbhpc-integration
+# PyTorch CUDA wheel channel. cu118 wheels include Pascal/Volta (sm_61/sm_70,
+# e.g. GTX 1080 Ti) up through Hopper (sm_90). The cu126 wheels DROP everything
+# below sm_75, so a 1080 Ti hits "no kernel image available". Use cu126 only for
+# Blackwell-only nodes (sm_100/sm_120).
+ARG TORCH_CUDA=cu118
 RUN set -euo pipefail && \
     git clone --depth=1 --branch "$CELLSEG_REPO_REF" "$CELLSEG_REPO_URL" honeybee_cell_segmentation_pipeline && \
     cd honeybee_cell_segmentation_pipeline && \
     python install.py background-generator && \
-    # Ensure CUDA-enabled Torch in this env (for segmentation-models-pytorch)
-    python -m pip install --index-url https://download.pytorch.org/whl/cu126 \
-        torch torchvision torchaudio
+    # Ensure CUDA-enabled Torch in this env (segmentation-models-pytorch / MONAI).
+    # Pinned so the GPU arch coverage is predictable (see TORCH_CUDA above).
+    python -m pip install --index-url "https://download.pytorch.org/whl/${TORCH_CUDA}" \
+        torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1
 
 # Build-time sanity check: torch imports and the bb_hpc-facing API is present
 # (cams=/dates= prove we built the bbhpc-integration branch). Written as a single
