@@ -60,16 +60,58 @@ def expected_dirs(repo: Repository, begin, end) -> set[str]:
     return dirs
 
 
-def process_day(day_dir: Path, repo: Repository, dry_run: bool) -> tuple[int, int]:
-    """Returns (missing_created, files_seen)."""
+def _source_is_valid(src: Path, validate_source: bool) -> bool:
+    """
+    A source primary must be non-zero to be worth copying into other buckets.
+    0-byte files are aborted/partial writes (e.g. the bb_binary stub left when a
+    cross-boundary symlink hit EIO); copying them just propagates the corruption.
+    With validate_source=True, also reject non-zero-but-unreadable .bbb.
+    """
+    try:
+        if os.path.getsize(src) == 0:
+            return False
+    except OSError:
+        return False
+    if validate_source:
+        try:
+            from bb_hpc.src.fileinfo import is_bbb_file_valid_basicmatch
+            return is_bbb_file_valid_basicmatch(str(src), check_read_file=True)
+        except Exception:
+            return False
+    return True
+
+
+def process_day(day_dir: Path, repo: Repository, dry_run: bool,
+                validate_source: bool = False, prune_empty: bool = False) -> tuple[int, int, int]:
+    """Returns (missing_created, files_seen, pruned)."""
     files_seen = 0
     missing_created = 0
+    pruned = 0
     for root, _dirs, files in os.walk(day_dir):
         for name in files:
             if not name.endswith(".bbb"):
                 continue
             files_seen += 1
             src = Path(root) / name
+
+            # Guard: never propagate an empty/invalid primary into other buckets.
+            if not _source_is_valid(src, validate_source):
+                try:
+                    is_empty = os.path.getsize(src) == 0
+                except OSError:
+                    is_empty = False
+                if prune_empty and is_empty:
+                    print(f"[prune-empty] {'would remove' if dry_run else 'removing'} {src}")
+                    if not dry_run:
+                        try:
+                            src.unlink()
+                            pruned += 1
+                        except OSError as e:
+                            print(f"[prune-empty] failed to remove {src}: {e}")
+                else:
+                    print(f"[skip-empty] {src}")
+                continue
+
             try:
                 cam, begin, end = parse_video_fname(name, format="bbb")
             except Exception as e:
@@ -87,7 +129,7 @@ def process_day(day_dir: Path, repo: Repository, dry_run: bool) -> tuple[int, in
                     target_path.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src, target_path)
                     missing_created += 1
-    return missing_created, files_seen
+    return missing_created, files_seen, pruned
 
 
 def parse_args():
@@ -97,6 +139,10 @@ def parse_args():
     p.add_argument("--paths", choices=["auto", "local", "hpc"], default="auto",
                    help="Which settings paths to use (auto prefers *_local if they exist).")
     p.add_argument("--dry-run", action="store_true", help="Print planned copies without writing.")
+    p.add_argument("--validate-source", action="store_true",
+                   help="Also skip sources that are non-zero but unreadable (reads each .bbb; slower).")
+    p.add_argument("--prune-empty-primaries", action="store_true",
+                   help="Delete 0-byte .bbb files encountered instead of just skipping them (respects --dry-run).")
     return p.parse_args()
 
 
@@ -129,20 +175,26 @@ def main():
 
     total_missing = 0
     total_files = 0
+    total_pruned = 0
     for d in dates:
         day_dir = Path(pipeline_root) / d[:4] / d[4:6] / d[6:8]
         if not day_dir.exists():
             print(f"[skip] missing day directory: {day_dir}")
             continue
         print(f"[scan] {day_dir}")
-        missing, seen = process_day(day_dir, repo, args.dry_run)
+        missing, seen, pruned = process_day(
+            day_dir, repo, args.dry_run,
+            validate_source=args.validate_source,
+            prune_empty=args.prune_empty_primaries,
+        )
         total_missing += missing
         total_files += seen
+        total_pruned += pruned
         suffix = "(dry-run)" if args.dry_run else ""
-        print(f"[day] files={seen} added={missing} {suffix}".strip())
+        print(f"[day] files={seen} added={missing} pruned={pruned} {suffix}".strip())
 
     suffix = "(dry-run)" if args.dry_run else ""
-    print(f"[total] files={total_files} added={total_missing} {suffix}".strip())
+    print(f"[total] files={total_files} added={total_missing} pruned={total_pruned} {suffix}".strip())
 
 
 if __name__ == "__main__":

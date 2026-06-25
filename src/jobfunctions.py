@@ -16,6 +16,12 @@ def job_for_process_videos(
     # optional local staging to reduce shared-storage I/O:
     copy_local=False,
     local_cache_dir="/tmp/bb_localcache",
+    # robustness knobs (transient shared-storage I/O, e.g. CIFS EIO on symlink):
+    max_attempts=3,
+    retry_backoff_sec=5.0,
+    skip_existing=True,
+    failure_list_dir=None,
+    shard_tag=None,
 ):
     """
     Run bb_pipeline.process_video on a list of video paths.
@@ -23,6 +29,16 @@ def job_for_process_videos(
     - Self-contained (safe for slurmhelper).
     - If copy_local=True, each video (and its .txt sidecar if present) is copied
       to `local_cache_dir` before processing, then cleaned up afterwards.
+    - Each video is retried up to `max_attempts` times on transient errors; the
+      partial/0-byte primary .bbb is cleared between attempts so bb_binary writes
+      a clean file (its add() truncates, so there is no duplicate-frame append).
+      A video counts as successful only when its primary .bbb exists and is
+      non-zero. If any video still fails, the failed source paths are written
+      under `failure_list_dir` (default <repo>/_detect_failures) and the function
+      exits non-zero so the k8s/Slurm job is marked Failed and retried — mirroring
+      the other chunk runners in this file.
+    - If skip_existing=True, a video whose primary .bbb already exists and is
+      non-zero is skipped, so a whole-pod retry redoes only the missing ones.
     """
     if not video_paths:
         return True
@@ -30,7 +46,7 @@ def job_for_process_videos(
         raise ValueError("repo_output_path must be provided")
 
     # Local helpers kept inline so the function remains self-contained.
-    import os, shutil, gc
+    import os, shutil, gc, time
     from pathlib import Path
 
     def _safe_makedirs(p: Path):
@@ -103,22 +119,89 @@ def job_for_process_videos(
 
     # Import inside the function (slurmhelper-safe)
     from pipeline.scripts.bb_pipeline import process_video
+    from bb_binary.parsing import parse_video_fname, get_video_fname
+
+    def _expected_primary_abs(video_basename):
+        """
+        Absolute path of the PRIMARY .bbb output bb_binary will write for this
+        video. Mirrors src.fileinfo.get_bbb_file_path and bb_binary
+        Repository._path_for_dt (20-min buckets: floor(minute/20)*20).
+        NOTE: the bucket width 20 must track Repository.minute_step.
+        Returns None if the filename cannot be parsed.
+        """
+        try:
+            cam_id, start, end = parse_video_fname(video_basename)
+            minute = int(start.minute // 20 * 20)
+            rel = (
+                f"{start.year}/{str(start.month).zfill(2)}/{str(start.day).zfill(2)}/"
+                f"{str(start.hour).zfill(2)}/{str(minute).zfill(2)}/"
+                f"{get_video_fname(cam_id, start, end)}.bbb"
+            )
+            return os.path.join(repo_output_path, rel)
+        except Exception:
+            return None
+
+    def _primary_ok(path):
+        """True iff the primary .bbb exists and is non-zero."""
+        try:
+            return path is not None and os.path.getsize(path) > 0
+        except OSError:
+            return False
 
     _safe_makedirs(Path(local_cache_dir))
 
+    total = len(video_paths)
+    failures = 0
+    failed_sources = []
+
     for vp in video_paths:
         src = Path(vp)
+        expected_abs = _expected_primary_abs(src.name)
+
+        # Runtime idempotency: skip videos whose primary already exists & is
+        # non-zero, so a whole-pod retry redoes only the missing/0-byte ones.
+        if skip_existing and _primary_ok(expected_abs):
+            print(f"[skip] already done: {src.name}")
+            continue
+
         vid_for_proc = src
         staged_txt = None
 
         try:
             if copy_local:
                 vid_for_proc, staged_txt = _stage_to_local(src)
-
             args.video_path = str(vid_for_proc)
-            process_video(args)
+
+            for attempt in range(1, int(max_attempts) + 1):
+                # Clear a partial/0-byte stub from a prior failed attempt so
+                # bb_binary writes a clean file. Only ever delete size==0, and
+                # only the PRIMARY bucket (the secondary copy is the job of
+                # check_symlinks_and_fill_in.py).
+                if expected_abs is not None and os.path.exists(expected_abs):
+                    try:
+                        if os.path.getsize(expected_abs) == 0:
+                            os.unlink(expected_abs)
+                    except OSError:
+                        pass
+
+                try:
+                    process_video(args)
+                    # Success requires a real (non-zero) primary on disk; fall
+                    # back to "no exception" only when the path is unknowable.
+                    if expected_abs is None or _primary_ok(expected_abs):
+                        break
+                    raise OSError(f"primary .bbb missing/empty after process_video: {expected_abs}")
+                except Exception as e:
+                    if attempt < int(max_attempts):
+                        print(f"[retry] {src.name} attempt {attempt}/{int(max_attempts)} failed ({e}); retrying")
+                        if retry_backoff_sec:
+                            time.sleep(float(retry_backoff_sec) * attempt)
+                    else:
+                        raise
 
         except Exception as e:
+            failures += 1
+            failed_sources.append(str(src))
             print(f"[WARN] error processing {src}: {e}")
         finally:
             args.video_path = None
@@ -126,6 +209,25 @@ def job_for_process_videos(
             # cleanup staged files to avoid filling the node
             if copy_local and vid_for_proc != src:
                 _cleanup_staged([vid_for_proc, staged_txt])
+
+    print(f"[process_videos] {total - failures}/{total} ok, {failures} failed", flush=True)
+
+    if failures:
+        # Durable failure record — pod logs are the only other evidence and they
+        # vanish on GC. Never let a write error here mask the non-zero exit.
+        try:
+            fdir = failure_list_dir or os.path.join(repo_output_path, "_detect_failures")
+            _safe_makedirs(Path(fdir))
+            idx = os.environ.get("JOB_COMPLETION_INDEX", "x")
+            worker = shard_tag or os.getpid()
+            fpath = os.path.join(fdir, f"detect_failures_idx{idx}_{worker}_{int(time.time())}.txt")
+            with open(fpath, "w") as fh:
+                fh.write("\n".join(failed_sources) + "\n")
+            print(f"[process_videos] wrote {len(failed_sources)} failures -> {fpath}", flush=True)
+        except Exception as e:
+            print(f"[process_videos] could not write failure list: {e}", flush=True)
+        import sys
+        sys.exit(1)
 
     return True
 

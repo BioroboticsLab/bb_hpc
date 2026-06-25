@@ -81,6 +81,30 @@ def write_shard(dir_host: Path, idx: int, work_units) -> Path:
     return f
 
 
+def gpu_docker_flags(gpu_id):
+    """How to expose a GPU to the container, per settings.docker['gpu_mode']:
+      - "gpus"   : --gpus device=<id>  (+ --runtime if set)  [Docker native / CDI]
+      - "nvidia" : --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=<id>  [legacy toolkit]
+      - "cdi"    : --device nvidia.com/gpu=<id>  (needs /etc/cdi spec)
+    """
+    dkr = settings.docker
+    mode = dkr.get("gpu_mode", "gpus")
+    runtime = dkr.get("runtime")
+    if mode == "nvidia":
+        flags = ["--runtime", str(runtime or "nvidia"),
+                 "-e", f"NVIDIA_VISIBLE_DEVICES={gpu_id}",
+                 "-e", "NVIDIA_DRIVER_CAPABILITIES=compute,utility"]
+    elif mode == "cdi":
+        flags = ["--device", f"nvidia.com/gpu={gpu_id}"]
+        if runtime:
+            flags += ["--runtime", str(runtime)]
+    else:  # "gpus"
+        flags = ["--gpus", f"device={gpu_id}"]
+        if runtime:
+            flags += ["--runtime", str(runtime)]
+    return flags
+
+
 def docker_run_cmd(image, gpu_id, binds, env, runner_path, shard_container, conda_env):
     payload = f"""set -euo pipefail
 if [ -f /opt/conda/etc/profile.d/conda.sh ]; then
@@ -91,10 +115,7 @@ export PYTHONPATH="{env.get('PYTHONPATH', '')}:${{PYTHONPATH:-}}"
 
 python -u {shlex.quote(runner_path)} {shlex.quote(shard_container)}
 """
-    parts = ["docker", "run", "--rm", "--gpus", f"device={gpu_id}"]
-    runtime = settings.docker.get("runtime")
-    if runtime:
-        parts += ["--runtime", str(runtime)]
+    parts = ["docker", "run", "--rm"] + gpu_docker_flags(gpu_id)
     for k, v in env.items():
         parts += ["-e", f"{k}={v}"]
     for host_p, cont_p in binds:

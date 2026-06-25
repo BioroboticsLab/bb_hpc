@@ -459,8 +459,15 @@ def is_bbb_file_valid_basicmatch(bbb_file, check_read_file = False):
     if not os.path.exists(bbb_file):
         return False
     else:
-        if not check_read_file:  # this is the simple and fast check: just see if the file exists.
-            return True
+        if not check_read_file:
+            # Fast check: exists AND non-zero. A valid .bbb always has capnp
+            # framing, so a 0-byte file is an aborted/partial write (e.g. the
+            # bb_binary stub left when a cross-boundary symlink hit EIO) and must
+            # NOT count as "already done" — otherwise re-submits skip it forever.
+            try:
+                return os.path.getsize(bbb_file) != 0
+            except OSError:
+                return False
         else:
             try:
                 if os.path.getsize(bbb_file) == 0:

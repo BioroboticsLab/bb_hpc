@@ -38,6 +38,11 @@ def main():
     num_threads      = int(ds.get("num_threads", 1))
     copy_local       = bool(ds.get("copy_local", True))
     cache_dir        = ds.get("local_cache_dir", "/tmp/bb_localcache")
+    # robustness knobs (transient shared-storage I/O)
+    max_attempts     = int(ds.get("max_attempts", 3))
+    retry_backoff_sec= float(ds.get("retry_backoff_sec", 5))
+    skip_existing    = bool(ds.get("skip_existing", True))
+    failure_list_dir = ds.get("failure_list_dir", None)
 
     job_for_process_videos(
         video_paths=videos,
@@ -48,6 +53,11 @@ def main():
         video_file_type=video_file_type,
         copy_local=copy_local,
         local_cache_dir=cache_dir,
+        max_attempts=max_attempts,
+        retry_backoff_sec=retry_backoff_sec,
+        skip_existing=skip_existing,
+        failure_list_dir=failure_list_dir,
+        shard_tag=filelist.name,
     )
 
 if __name__ == "__main__":

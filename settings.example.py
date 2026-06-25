@@ -34,6 +34,11 @@ detect_settings = {
     "jobtime_minutes": 60,
     "maxjobs": None,
     "jobname": "detect",
+    # Robustness to transient shared-storage I/O (e.g. CIFS EIO on cross-boundary symlink):
+    "max_attempts": 3,           # per-video retries before giving up
+    "retry_backoff_sec": 5,      # base backoff between attempts (scaled by attempt #)
+    "skip_existing": True,       # runtime skip of videos whose primary .bbb is already non-zero
+    "failure_list_dir": None,    # durable failure list dir; None -> <pipeline_root>/_detect_failures
     # per-job Slurm overrides (optional)
     "slurm": {
         "max_memory": "6GB",
@@ -259,6 +264,12 @@ docker = {
     "image_comb": os.environ.get("DOCKER_IMAGE_COMB", "jacobdavidson/comb-background:latest"),
     "comb_conda_env": "combbg",
     "runtime": "nvidia",
+    # How to give a container a GPU. If `--gpus` fails with "failed to discover GPU
+    # vendor from CDI", this node uses the legacy nvidia toolkit -> set "nvidia".
+    #   "gpus"   -> --gpus device=<id>            (Docker native; may route via CDI)
+    #   "nvidia" -> --runtime=nvidia + NVIDIA_VISIBLE_DEVICES=<id>  (legacy toolkit)
+    #   "cdi"    -> --device nvidia.com/gpu=<id>  (needs /etc/cdi/*.yaml)
+    "gpu_mode": "gpus",
     "runner_path": os.path.join(bb_hpc_dir_hpc, "running_k8s/run_videos.py"),
     "runner_path_rpi": os.path.join(bb_hpc_dir_hpc, "running_k8s/run_rpi_videos.py"),
     "runner_path_save_detect": os.path.join(bb_hpc_dir_hpc, "running_k8s/run_save_detect.py"),
