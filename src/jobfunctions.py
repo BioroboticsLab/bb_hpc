@@ -46,7 +46,7 @@ def job_for_process_videos(
         raise ValueError("repo_output_path must be provided")
 
     # Local helpers kept inline so the function remains self-contained.
-    import os, shutil, gc, time
+    import os, shutil, gc, time, errno
     from pathlib import Path
 
     def _safe_makedirs(p: Path):
@@ -150,65 +150,121 @@ def job_for_process_videos(
 
     _safe_makedirs(Path(local_cache_dir))
 
+    # --- Tolerate cross-boundary symlink failures on shares that can't make
+    # symlinks (this CIFS share returns EIO). bb_binary writes a 0-byte primary
+    # stub, then creates the redundant cross-boundary bucket entry with
+    # os.symlink, then writes the primary content. A raised symlink error would
+    # abort the whole video and leave a 0-byte primary. So for .bbb links we
+    # swallow the symlink error, remember the (target, link) pair, and after the
+    # primary is confirmed non-zero we materialize the cross-boundary entry as a
+    # real copy (exactly what check_symlinks_and_fill_in.py would do later). This
+    # makes detect self-contained: no separate fill-in pass needed before
+    # tracking. Scoped to .bbb so unrelated symlinks are untouched; restored in
+    # finally. (See bb_binary Repository._create_file_and_symlinks.)
+    _real_symlink = os.symlink
+    _deferred_links = []
+
+    def _tolerant_symlink(target, link_path, *a, **k):
+        try:
+            return _real_symlink(target, link_path, *a, **k)
+        except OSError as e:
+            if str(link_path).endswith(".bbb"):
+                print(f"[symlink-fallback] {type(e).__name__}(errno={e.errno}) on {link_path}; will copy after write")
+                _deferred_links.append((os.fspath(target), os.fspath(link_path)))
+                return None
+            raise
+
+    def _materialize_deferred_links():
+        # Create the cross-boundary entries as real copies now that the primary
+        # exists and is non-zero. `target` is the (usually relative) link goal.
+        for target, link_path in _deferred_links:
+            try:
+                # A non-zero secondary is already good; a 0-byte one is a stale
+                # stub from a prior partial run -> overwrite it rather than skip.
+                if os.path.exists(link_path):
+                    try:
+                        if os.path.getsize(link_path) > 0:
+                            continue
+                        os.unlink(link_path)
+                    except OSError:
+                        continue
+                real_src = os.path.normpath(os.path.join(os.path.dirname(link_path), target))
+                if os.path.getsize(real_src) > 0:
+                    _safe_makedirs(Path(link_path).parent)
+                    shutil.copy2(real_src, link_path)
+            except Exception as e:
+                # non-fatal: a later check_symlinks_and_fill_in.py pass can fix it
+                print(f"[symlink-fallback] could not copy cross-boundary entry {link_path}: {e}")
+        _deferred_links.clear()
+
+    os.symlink = _tolerant_symlink
+
     total = len(video_paths)
     failures = 0
     failed_sources = []
 
-    for vp in video_paths:
-        src = Path(vp)
-        expected_abs = _expected_primary_abs(src.name)
+    try:
+        for vp in video_paths:
+            src = Path(vp)
+            expected_abs = _expected_primary_abs(src.name)
 
-        # Runtime idempotency: skip videos whose primary already exists & is
-        # non-zero, so a whole-pod retry redoes only the missing/0-byte ones.
-        if skip_existing and _primary_ok(expected_abs):
-            print(f"[skip] already done: {src.name}")
-            continue
+            # Runtime idempotency: skip videos whose primary already exists & is
+            # non-zero, so a whole-pod retry redoes only the missing/0-byte ones.
+            if skip_existing and _primary_ok(expected_abs):
+                print(f"[skip] already done: {src.name}")
+                continue
 
-        vid_for_proc = src
-        staged_txt = None
+            vid_for_proc = src
+            staged_txt = None
 
-        try:
-            if copy_local:
-                vid_for_proc, staged_txt = _stage_to_local(src)
-            args.video_path = str(vid_for_proc)
+            try:
+                if copy_local:
+                    vid_for_proc, staged_txt = _stage_to_local(src)
+                args.video_path = str(vid_for_proc)
 
-            for attempt in range(1, int(max_attempts) + 1):
-                # Clear a partial/0-byte stub from a prior failed attempt so
-                # bb_binary writes a clean file. Only ever delete size==0, and
-                # only the PRIMARY bucket (the secondary copy is the job of
-                # check_symlinks_and_fill_in.py).
-                if expected_abs is not None and os.path.exists(expected_abs):
+                for attempt in range(1, int(max_attempts) + 1):
+                    _deferred_links.clear()
+                    # Clear a partial/0-byte stub from a prior failed attempt so
+                    # bb_binary writes a clean file. Only ever delete size==0, and
+                    # only the PRIMARY bucket.
+                    if expected_abs is not None and os.path.exists(expected_abs):
+                        try:
+                            if os.path.getsize(expected_abs) == 0:
+                                os.unlink(expected_abs)
+                        except OSError:
+                            pass
+
                     try:
-                        if os.path.getsize(expected_abs) == 0:
-                            os.unlink(expected_abs)
-                    except OSError:
-                        pass
+                        process_video(args)
+                        # Success requires a real (non-zero) primary on disk; fall
+                        # back to "no exception" only when the path is unknowable.
+                        if expected_abs is None or _primary_ok(expected_abs):
+                            if expected_abs is None:
+                                print(f"[WARN] {src.name}: could not compute expected .bbb path; "
+                                      f"counting as done without verifying output")
+                            _materialize_deferred_links()
+                            break
+                        raise OSError(f"primary .bbb missing/empty after process_video: {expected_abs}")
+                    except Exception as e:
+                        if attempt < int(max_attempts):
+                            print(f"[retry] {src.name} attempt {attempt}/{int(max_attempts)} failed ({e}); retrying")
+                            if retry_backoff_sec:
+                                time.sleep(float(retry_backoff_sec) * attempt)
+                        else:
+                            raise
 
-                try:
-                    process_video(args)
-                    # Success requires a real (non-zero) primary on disk; fall
-                    # back to "no exception" only when the path is unknowable.
-                    if expected_abs is None or _primary_ok(expected_abs):
-                        break
-                    raise OSError(f"primary .bbb missing/empty after process_video: {expected_abs}")
-                except Exception as e:
-                    if attempt < int(max_attempts):
-                        print(f"[retry] {src.name} attempt {attempt}/{int(max_attempts)} failed ({e}); retrying")
-                        if retry_backoff_sec:
-                            time.sleep(float(retry_backoff_sec) * attempt)
-                    else:
-                        raise
-
-        except Exception as e:
-            failures += 1
-            failed_sources.append(str(src))
-            print(f"[WARN] error processing {src}: {e}")
-        finally:
-            args.video_path = None
-            gc.collect()
-            # cleanup staged files to avoid filling the node
-            if copy_local and vid_for_proc != src:
-                _cleanup_staged([vid_for_proc, staged_txt])
+            except Exception as e:
+                failures += 1
+                failed_sources.append(str(src))
+                print(f"[WARN] error processing {src}: {e}")
+            finally:
+                args.video_path = None
+                gc.collect()
+                # cleanup staged files to avoid filling the node
+                if copy_local and vid_for_proc != src:
+                    _cleanup_staged([vid_for_proc, staged_txt])
+    finally:
+        os.symlink = _real_symlink
 
     print(f"[process_videos] {total - failures}/{total} ok, {failures} failed", flush=True)
 

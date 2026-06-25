@@ -109,6 +109,37 @@ def _process_video(args):
         f.write("DETECTIONS")
 
 
+def _bucket_path(repo_root, video_basename, dt):
+    """Path of the .bbb in the 20-min bucket containing `dt`."""
+    cam, start, end = _parse_video_fname(video_basename)
+    m = dt.minute // 20 * 20
+    rel = (
+        f"{dt.year}/{str(dt.month).zfill(2)}/{str(dt.day).zfill(2)}/"
+        f"{str(dt.hour).zfill(2)}/{str(m).zfill(2)}/"
+        f"{_get_video_fname(cam, start, end)}.bbb"
+    )
+    return os.path.join(repo_root, rel)
+
+
+def _process_video_boundary(args):
+    """Mimic bb_binary for a boundary-spanning video: 0-byte stub, THEN the
+    cross-boundary os.symlink (which the runner's shim intercepts), THEN write
+    content. Reproduces the exact ordering that loses data when symlink raises."""
+    _STATE["calls"] += 1
+    name = os.path.basename(args.video_path)
+    _cam, start, end = _parse_video_fname(name)
+    primary = _bucket_path(args.repo_output_path, name, start)
+    secondary = _bucket_path(args.repo_output_path, name, end)
+    os.makedirs(os.path.dirname(primary), exist_ok=True)
+    open(primary, "w").close()  # 0-byte stub, like bb_binary's add()
+    if os.path.dirname(primary) != os.path.dirname(secondary):
+        rel = os.path.relpath(primary, os.path.dirname(secondary))
+        os.makedirs(os.path.dirname(secondary), exist_ok=True)
+        os.symlink(rel, secondary)  # intercepted by the runner shim -> EIO -> deferred
+    with open(primary, "w") as f:
+        f.write("DETECTIONS")
+
+
 # If the real bb_binary/pipeline are installed (e.g. on the cluster), this
 # hermetic test would clobber them for sibling tests in a shared pytest session,
 # so skip it there — test_pipeline_single_video.py covers the real-deps path.
@@ -267,6 +298,67 @@ def test_fillin_source_guard_rejects_zero_byte():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_boundary_symlink_eio_writes_primary_and_copies():
+    repo = tempfile.mkdtemp()
+    real_symlink = os.symlink
+    bbp = sys.modules["pipeline.scripts.bb_pipeline"]
+    saved_pv = bbp.process_video
+    try:
+        _reset()
+
+        def _eio_symlink(target, link, *a, **k):   # this CIFS share's behavior
+            raise OSError(errno.EIO, "Input/output error")
+
+        os.symlink = _eio_symlink
+        bbp.process_video = _process_video_boundary
+
+        name = _video_name(cam=0, start="20260624T221913", end="20260624T222013")  # :19 -> :20
+        res = _run(repo, [str(Path(repo) / name)])
+
+        primary = _bucket_path(repo, name, datetime(2026, 6, 24, 22, 19, 13))
+        secondary = _bucket_path(repo, name, datetime(2026, 6, 24, 22, 20, 13))
+        assert res is True
+        assert _STATE["calls"] == 1, "should succeed on first attempt (symlink tolerated, not retried)"
+        assert os.path.getsize(primary) > 0, "primary must be written despite the symlink EIO"
+        assert os.path.exists(secondary) and os.path.getsize(secondary) > 0, \
+            "cross-boundary entry must be materialized as a real copy"
+        assert not Path(repo, "_detect_failures").exists(), "no failure on a tolerated symlink"
+        print("ok: boundary symlink EIO -> primary written + cross-boundary copy created")
+    finally:
+        os.symlink = real_symlink
+        bbp.process_video = saved_pv
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+def test_materialize_overwrites_zero_byte_secondary():
+    repo = tempfile.mkdtemp()
+    real_symlink = os.symlink
+    bbp = sys.modules["pipeline.scripts.bb_pipeline"]
+    saved_pv = bbp.process_video
+    try:
+        _reset()
+
+        def _eio_symlink(target, link, *a, **k):
+            raise OSError(errno.EIO, "Input/output error")
+
+        os.symlink = _eio_symlink
+        bbp.process_video = _process_video_boundary
+
+        name = _video_name(cam=0, start="20260624T221913", end="20260624T222013")
+        secondary = _bucket_path(repo, name, datetime(2026, 6, 24, 22, 20, 13))
+        os.makedirs(os.path.dirname(secondary), exist_ok=True)
+        open(secondary, "w").close()  # legacy 0-byte secondary stub from a prior partial run
+
+        res = _run(repo, [str(Path(repo) / name)])
+        assert res is True
+        assert os.path.getsize(secondary) > 0, "pre-existing 0-byte secondary must be overwritten with a real copy"
+        print("ok: materialize overwrites a pre-existing 0-byte secondary")
+    finally:
+        os.symlink = real_symlink
+        bbp.process_video = saved_pv
+        shutil.rmtree(repo, ignore_errors=True)
+
+
 _TESTS = [
     test_transient_failure_is_retried_and_succeeds,
     test_persistent_failure_exits_nonzero_and_records,
@@ -274,6 +366,8 @@ _TESTS = [
     test_zero_byte_primary_is_not_skipped,
     test_is_bbb_basicmatch_rejects_zero_byte,
     test_fillin_source_guard_rejects_zero_byte,
+    test_boundary_symlink_eio_writes_primary_and_copies,
+    test_materialize_overwrites_zero_byte_secondary,
 ]
 
 

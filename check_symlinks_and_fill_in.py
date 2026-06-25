@@ -120,10 +120,25 @@ def process_day(day_dir: Path, repo: Repository, dry_run: bool,
 
             for target_dir in expected_dirs(repo, begin, end):
                 target_path = Path(target_dir) / name
-                if target_path.samefile(src) if target_path.exists() else False:
-                    continue
                 if target_path.exists():
-                    continue
+                    try:
+                        if target_path.samefile(src):
+                            continue
+                    except OSError:
+                        pass
+                    # A non-zero copy already exists -> done. A 0-byte stub from a
+                    # prior partial run -> replace it (don't leave corruption).
+                    try:
+                        if target_path.stat().st_size > 0:
+                            continue
+                    except OSError:
+                        continue
+                    print(f"[replace-empty] {'would replace' if dry_run else 'replacing'} 0-byte {target_path}")
+                    if not dry_run:
+                        try:
+                            target_path.unlink()
+                        except OSError:
+                            continue
                 print(f"[missing] would add {target_path} (source {src})")
                 if not dry_run:
                     target_path.parent.mkdir(parents=True, exist_ok=True)
