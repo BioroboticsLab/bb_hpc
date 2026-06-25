@@ -90,6 +90,9 @@ def gpu_docker_flags(gpu_id):
     dkr = settings.docker
     mode = dkr.get("gpu_mode", "gpus")
     runtime = dkr.get("runtime")
+    if mode in ("none", "cpu"):
+        # CPU-only: no GPU flags, no nvidia runtime.
+        return []
     if mode == "nvidia":
         flags = ["--runtime", str(runtime or "nvidia"),
                  "-e", f"NVIDIA_VISIBLE_DEVICES={gpu_id}",
