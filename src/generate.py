@@ -728,6 +728,8 @@ def generate_jobs_background(
     label=None,             # output sub-key under the output base for source_dir mode
     out_dir=None,           # explicit output base (defaults to backgrounds_root_dir)
     cams=None,              # optional camera filter, e.g. ["cam-0", "cam-1"]
+    dates=None,             # optional YYYYMMDD day filter; source_dir mode -> one (cam, day) unit each
+    min_frames=3,           # skip a (cam, day) with fewer frames than the engine needs (windowed mode)
 ):
     """
     Yield chunks of (scope, camera) background-generation work units.
@@ -752,8 +754,13 @@ def generate_jobs_background(
     ------
     dict: {"work_units": [ {date, cam, frames_root, backgrounds_root, <bg knobs>,
                             (source_path, output_path in explicit-dir mode)}, ... ]}
+
+    Day-sharding (``dates`` + ``source_dir``): emits one work unit per (cam, day)
+    so each task masks/backgrounds only that day -- bounded runtime, parallelizable.
+    Days with fewer than ``min_frames`` frames are skipped (the engine could not
+    produce a background for them, so they must not be scheduled forever).
     """
-    import os, glob
+    import os, glob, re
 
     try:
         from background_generator import windowing
@@ -769,6 +776,9 @@ def generate_jobs_background(
                else f"count_w{window_size}_n{num_median_images}_int{interval}s")
 
     cam_filter = set(cams) if cams else None
+    # Day filter is only meaningful in explicit-dir mode (date mode already shards
+    # per date via scopes). Dedup so a repeated date does not emit duplicate units.
+    dates_filter = list(dict.fromkeys(dates)) if (dates and source_dir is not None) else None
 
     def _knobs():
         return {
@@ -783,7 +793,22 @@ def generate_jobs_background(
             "median_computation": median_computation,
             "device": device,
             "memmap_dir": memmap_dir,
+            "min_frames": min_frames,
         }
+
+    def _day_of(name):
+        if windowing is not None:
+            ts = windowing.parse_ts_from_name(name)
+            return ts.strftime("%Y%m%d") if ts is not None else None
+        m = re.search(r"(\d{8})T\d{6}", name)
+        return m.group(1) if m else None
+
+    def _kept_count(names):
+        # Frames that survive interval subsampling -- mirrors the engine so the
+        # min_frames decision matches what the engine will actually do.
+        if frame_interval_sec and windowing is not None:
+            return len(windowing.select_by_interval(sorted(names), frame_interval_sec))
+        return len(names)
 
     def _is_done(out_cam_tag_dir, frame_names):
         if background_window and windowing is not None:
@@ -795,6 +820,24 @@ def generate_jobs_background(
         return os.path.isdir(out_cam_tag_dir) and any(
             fn.startswith("background_") and fn.endswith(".png") for fn in os.listdir(out_cam_tag_dir)
         )
+
+    def _make_unit(scope_id, cam, scan_dir, output_path, explicit, day=None):
+        unit = {
+            "date": scope_id,   # YYYYMMDD in date mode, label in explicit-dir mode
+            "cam": cam,
+            "dates": [day] if day else None,
+            "frames_root": frames_root_dir,
+            "backgrounds_root": backgrounds_root_dir,
+        }
+        if explicit:
+            # Already-resolved cluster paths; job_for_background_chunk uses these
+            # verbatim instead of reconstructing frames_root/<date>.
+            unit["source_path"] = scan_dir
+            unit["output_path"] = output_path
+        if day:
+            unit["day"] = day
+        unit.update(_knobs())
+        return unit
 
     # Each "scope" is (scan_dir, output_path, scope_id, explicit). One per date in
     # date mode; a single scope (no date level) in explicit-dir mode.
@@ -826,32 +869,41 @@ def generate_jobs_background(
                 continue
 
             out_cam_tag_dir = os.path.join(output_path, cam, tag)
-            if _is_done(out_cam_tag_dir, frame_names):
-                if verbose:
-                    print(f"[background] done: {scope_id}/{cam} [{tag}]")
-                continue
 
-            unit = {
-                "date": scope_id,   # YYYYMMDD in date mode, label in explicit-dir mode
-                "cam": cam,
-                "frames_root": frames_root_dir,
-                "backgrounds_root": backgrounds_root_dir,
-            }
-            if explicit:
-                # Already-resolved cluster paths; job_for_background_chunk uses these
-                # verbatim instead of reconstructing frames_root/<date>.
-                unit["source_path"] = scan_dir
-                unit["output_path"] = output_path
-            unit.update(_knobs())
-            units.append(unit)
+            if dates_filter is not None:
+                # One unit per requested day (each task masks/backgrounds that day only).
+                by_day = {}
+                for fn in frame_names:
+                    d = _day_of(fn)
+                    if d is not None:
+                        by_day.setdefault(d, []).append(fn)
+                for d in dates_filter:
+                    day_frames = by_day.get(d, [])
+                    if _kept_count(day_frames) < int(min_frames):
+                        if verbose:
+                            print(f"[background] skip {scope_id}/{cam} {d}: "
+                                  f"{len(day_frames)} frame(s) < min_frames={min_frames}")
+                        continue
+                    if _is_done(out_cam_tag_dir, day_frames):
+                        if verbose:
+                            print(f"[background] done: {scope_id}/{cam} {d} [{tag}]")
+                        continue
+                    units.append(_make_unit(scope_id, cam, scan_dir, output_path, explicit, day=d))
+            else:
+                if _is_done(out_cam_tag_dir, frame_names):
+                    if verbose:
+                        print(f"[background] done: {scope_id}/{cam} [{tag}]")
+                    continue
+                units.append(_make_unit(scope_id, cam, scan_dir, output_path, explicit))
 
-    units.sort(key=lambda u: (u["date"], u["cam"]))
+    units.sort(key=lambda u: (u["date"], u["cam"], u.get("day") or ""))
     if maxjobs is not None:
         units = units[: int(chunk_size) * int(maxjobs)]
 
     print(f"[background] scopes={n_scopes} units={len(units)} chunk_size={chunk_size} "
           f"maxjobs={maxjobs} tag={tag}"
-          + (f" source_dir={source_dir}" if source_dir else ""))
+          + (f" source_dir={source_dir}" if source_dir else "")
+          + (f" dates={dates_filter}" if dates_filter is not None else ""))
 
     for i in range(0, len(units), int(chunk_size)):
         yield {"work_units": units[i:i + int(chunk_size)]}

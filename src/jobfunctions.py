@@ -922,14 +922,21 @@ def job_for_background_chunk(work_units):
                 frame_interval_sec=u.get("frame_interval_sec", None),
                 background_window=u.get("background_window", None),
                 memmap_dir=u.get("memmap_dir", None),
+                min_frames=u.get("min_frames", 3),
             )
 
-            generator = BackgroundImageGenerator(
+            gen_kwargs = dict(
                 source_path=source_path,
                 output_path=output_path,
                 config=config,
                 cams=[cam],
             )
+            # Pass the day filter only when sharding by day, so non-dates runs keep
+            # working against an engine build that predates the `dates` parameter.
+            if u.get("dates"):
+                gen_kwargs["dates"] = u["dates"]
+
+            generator = BackgroundImageGenerator(**gen_kwargs)
             generator.run()
         except Exception as e:
             failures += 1

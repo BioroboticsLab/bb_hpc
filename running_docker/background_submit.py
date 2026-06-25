@@ -36,10 +36,12 @@ def parse_args():
     yesterday = (now - timedelta(days=1)).strftime("%Y%m%d")
 
     p = argparse.ArgumentParser(description="Submit cell-seg background-generation shards to local Docker")
-    p.add_argument("--dates", nargs="+", default=[yesterday, today],
-                   help="YYYYMMDD strings (UTC), date mode. Default: yesterday & today.")
+    p.add_argument("--dates", nargs="+", default=None,
+                   help="YYYYMMDD strings (UTC). Date mode: which dates to process "
+                        "(default: yesterday & today). With --source-dir: a per-DAY "
+                        "filter -> one (cam, day) shard each (omit = all days in the folder).")
     p.add_argument("--source-dir", default=None,
-                   help="Explicit frames dir containing cam-N/ (no date level). Overrides --dates.")
+                   help="Explicit frames dir containing cam-N/ (no date level).")
     p.add_argument("--label", default=None,
                    help="Output sub-key under --out-dir for --source-dir mode (default: source dir name).")
     p.add_argument("--out-dir", default=None,
@@ -52,7 +54,10 @@ def parse_args():
                    help='"auto", "all", or a comma list like "0,1" to limit which GPUs to use.')
     p.add_argument("--containers-per-gpu", type=int, default=1,
                    help="How many containers to run per GPU (default 1 for background).")
-    return p.parse_args()
+    args = p.parse_args()
+    if not args.source_dir and not args.dates:
+        args.dates = [yesterday, today]
+    return args
 
 
 def list_gpu_ids(request: str):
@@ -191,6 +196,8 @@ def main():
         label                = args.label,
         out_dir              = args.out_dir,
         cams                 = args.cams,
+        dates                = args.dates if args.source_dir else None,  # source-dir: per-day shard
+        min_frames           = int(s.get("min_frames", 3)),
     ))
     if not chunks:
         print("No background work to submit.")

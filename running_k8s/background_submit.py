@@ -151,6 +151,8 @@ def main():
         label                = args.label,
         out_dir              = args.out_dir,
         cams                 = args.cams,
+        dates                = args.dates if args.source_dir else None,  # source-dir: per-day shard
+        min_frames           = int(s.get("min_frames", 3)),
     ))
     if not chunks:
         print("No background work to submit.")
