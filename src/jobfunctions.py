@@ -966,7 +966,7 @@ def job_for_background_chunk(work_units):
                 output_path = Path(u["backgrounds_root"]) / date  # generator adds cam/<config-tag>
             output_path.mkdir(parents=True, exist_ok=True)
 
-            config = BgImageGenConfig(
+            cfg_kwargs = dict(
                 window_size=u.get("window_size", 10),
                 num_median_images=u.get("num_median_images", 200),
                 max_cycles=u.get("max_cycles", None),
@@ -980,6 +980,12 @@ def job_for_background_chunk(work_units):
                 memmap_dir=u.get("memmap_dir", None),
                 min_frames=u.get("min_frames", 3),
             )
+            # Drop None-valued optional knobs so the engine's own defaults apply.
+            # (BgImageGenConfig.max_cycles is typed `int` with default None, so
+            # passing None explicitly trips pydantic validation; for every optional
+            # knob here None == the engine default, so dropping None is equivalent.)
+            cfg_kwargs = {k: v for k, v in cfg_kwargs.items() if v is not None}
+            config = BgImageGenConfig(**cfg_kwargs)
 
             gen_kwargs = dict(
                 source_path=source_path,

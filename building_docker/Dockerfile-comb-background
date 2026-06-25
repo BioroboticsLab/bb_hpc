@@ -64,16 +64,10 @@ RUN set -euo pipefail && \
         torch torchvision torchaudio
 
 # Build-time sanity check: torch imports and the bb_hpc-facing API is present
-# (cams= proves we built the right branch).
-RUN python - <<'PY'
-import inspect, sys, torch
-from background_generator.background_img_generator import BackgroundImageGenerator as B
-sig = inspect.signature(B.__init__)
-print('Torch:', torch.__version__)
-print('BackgroundImageGenerator.__init__', sig)
-assert 'cams' in sig.parameters, "wrong branch: BackgroundImageGenerator has no cams= (need bbhpc-integration)"
-sys.exit(0)
-PY
+# (cams=/dates= prove we built the bbhpc-integration branch). Written as a single
+# `python -c` line because the miniforge stage uses SHELL ["/bin/bash","-lc"],
+# under which a RUN heredoc is NOT fed to stdin (it silently becomes a no-op).
+RUN python -c "import inspect, torch; from background_generator.background_img_generator import BackgroundImageGenerator as B; sig = inspect.signature(B.__init__); print('Torch:', torch.__version__); print('BackgroundImageGenerator.__init__', sig); assert 'cams' in sig.parameters and 'dates' in sig.parameters, 'wrong branch: need bbhpc-integration (cams=/dates= missing)'"
 
 # The frame extractor finds ffmpeg on PATH automatically (determine_ffmpeg_bin_path).
 # NOTE: the apt ffmpeg may lack NVDEC (hevc_cuvid). For GPU decode supply a
