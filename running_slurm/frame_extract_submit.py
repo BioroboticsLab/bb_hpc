@@ -58,12 +58,15 @@ def main():
     apply_slurm_to_job(job, slurm_cfg)  # GPU (gres) comes from frame_extract_settings.slurm
 
     job.clear_input_files = lambda: None  # keep existing queued input files
-    job.createjobs()
-    job.write_batch_file()
 
     if args.dry_run:
+        # Do NOT createjobs() on a dry-run -- it writes stale .dill inputs that the
+        # next real run would submit as phantom tasks (clear_input_files is disabled).
         print(f"Dry run: {len(chunks)} task(s) staged; not submitting.")
         return
+
+    job.createjobs()
+    job.write_batch_file()
 
     run_jobs_and_log(job, settings.jobdir_hpc, s.get("jobname", "frame_extract"), args.dates)
     print("[frame_extract_submit] Submitted.")

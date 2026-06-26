@@ -70,14 +70,17 @@ def main():
     job.set_job_arguments(job_args)
     apply_slurm_to_job(job, slurm_cfg) # Apply the merged config
 
-    # Generate input dill + batch file
     job.clear_input_files = lambda: None # this is needed so that createjobs() does not delete existing input files
-    job.createjobs()
-    job.write_batch_file()
 
     if args.dry_run:
+        # Do NOT createjobs() on a dry-run -- it writes stale .dill inputs that the
+        # next real run would submit as phantom tasks (clear_input_files is disabled).
         print("Dry run: not submitting.")
         return
+
+    # Generate input dill + batch file
+    job.createjobs()
+    job.write_batch_file()
 
     # Submit
     run_jobs_and_log(job, settings.jobdir_hpc, s_trk.get("jobname", "tracking"), args.dates)

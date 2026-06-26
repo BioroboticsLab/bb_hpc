@@ -85,13 +85,19 @@ def main():
 
     apply_slurm_to_job(job, slurm_cfg)  # GPU (gres) comes from background_settings.slurm
 
-    job.clear_input_files = lambda: None
-    job.createjobs()
-    job.write_batch_file()
+    job.clear_input_files = lambda: None  # keep existing queued input files
 
     if args.dry_run:
+        # IMPORTANT: do NOT createjobs() on a dry-run. createjobs() writes .dill
+        # input files, and because clear_input_files is disabled those stale,
+        # never-submitted inputs are picked up and submitted by the NEXT real run
+        # (slurmhelper run_jobs submits all un-submitted indices) -> phantom tasks
+        # running the wrong work unit.
         print(f"Dry run: {len(chunks)} task(s) staged; not submitting.")
         return
+
+    job.createjobs()
+    job.write_batch_file()
 
     log_scope = [args.label or "source_dir"] if args.source_dir else args.dates
     run_jobs_and_log(job, settings.jobdir_hpc, s.get("jobname", "background"), log_scope)

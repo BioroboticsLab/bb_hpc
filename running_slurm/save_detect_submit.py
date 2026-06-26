@@ -56,14 +56,17 @@ def main():
     # Ensure CPU-only
     job.n_gpus = 0
 
-    # Create inputs + batch file
     job.clear_input_files = lambda: None  # prevent createjobs() from deleting existing input files
-    job.createjobs()
-    job.write_batch_file()
 
     if args.dry_run:
+        # Do NOT createjobs() on a dry-run -- it writes stale .dill inputs that the
+        # next real run would submit as phantom tasks (clear_input_files is disabled).
         print("Dry run: not submitting. Use --run via slurmhelper if desired.")
         return
+
+    # Create inputs + batch file
+    job.createjobs()
+    job.write_batch_file()
 
     # Submit arrays (respects max_job_array_size / concurrent_job_limit)
     run_jobs_and_log(job, settings.jobdir_hpc, s_sd.get("jobname", "save_detect"), args.dates)
