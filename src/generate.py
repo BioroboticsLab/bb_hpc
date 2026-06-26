@@ -706,6 +706,57 @@ def generate_jobs_frame_extract(
 #################################################################
 ##### BACKGROUND (cell-seg heavy preprocessing)
 #################################################################
+def _expected_background_names_fallback(frame_names, frame_interval_sec, background_window):
+    """Dependency-free mirror of ``background_generator.windowing.expected_background_names``.
+
+    Lets the SUBMIT HOST compute the exact per-window background output filenames
+    for the skip check even when the heavy cell-seg package is not installed
+    there (e.g. Konstanz Docker/k8s submit, where the work runs in the container).
+    Must stay in sync with the fork's windowing.py, which is the canonical version
+    and is used instead whenever it is importable.
+    """
+    import re as _re
+    from datetime import datetime as _dt, timedelta as _td
+
+    def _ts(name):
+        m = _re.search(r"(\d{8}T\d{6})", name)
+        if not m:
+            return None
+        try:
+            return _dt.strptime(m.group(1), "%Y%m%dT%H%M%S")
+        except ValueError:
+            return None
+
+    def _bucket(ts):
+        if background_window == "hour":
+            return ts.replace(minute=0, second=0, microsecond=0)
+        if background_window == "day":
+            return ts.replace(hour=0, minute=0, second=0, microsecond=0)
+        sec = int(background_window)
+        day0 = ts.replace(hour=0, minute=0, second=0, microsecond=0)
+        off = int((ts - day0).total_seconds())
+        return day0 + _td(seconds=(off // sec) * sec)
+
+    names = sorted(frame_names)
+    if frame_interval_sec:
+        kept, last = [], None
+        for n in names:
+            ts = _ts(n)
+            if ts is None:
+                continue
+            if last is None or (ts - last).total_seconds() >= int(frame_interval_sec):
+                kept.append(n)
+                last = ts
+        names = kept
+
+    buckets = set()
+    for n in names:
+        ts = _ts(n)
+        if ts is not None:
+            buckets.add(_bucket(ts))
+    return {"background_" + b.strftime("%Y%m%dT%H%M%S") + ".000000.000Z.png" for b in buckets}
+
+
 def generate_jobs_background(
     frames_root_dir,        # e.g. settings.frames_dir_hpc
     backgrounds_root_dir,   # e.g. settings.backgrounds_dir_hpc
@@ -810,13 +861,21 @@ def generate_jobs_background(
             return len(windowing.select_by_interval(sorted(names), frame_interval_sec))
         return len(names)
 
+    def _expected(names):
+        # Use the engine's canonical windowing when importable, else the
+        # dependency-free mirror, so the per-day skip is precise on any host.
+        if windowing is not None:
+            return windowing.expected_background_names(names, frame_interval_sec, background_window)
+        return _expected_background_names_fallback(names, frame_interval_sec, background_window)
+
     def _is_done(out_cam_tag_dir, frame_names):
-        if background_window and windowing is not None:
-            expected = windowing.expected_background_names(frame_names, frame_interval_sec, background_window)
+        if background_window:
+            expected = _expected(frame_names)
             if not expected:
                 return False
             existing = set(os.listdir(out_cam_tag_dir)) if os.path.isdir(out_cam_tag_dir) else set()
             return expected.issubset(existing)
+        # Count/rolling mode (no window): a present background is "done enough".
         return os.path.isdir(out_cam_tag_dir) and any(
             fn.startswith("background_") and fn.endswith(".png") for fn in os.listdir(out_cam_tag_dir)
         )
