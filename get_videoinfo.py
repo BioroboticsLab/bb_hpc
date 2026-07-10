@@ -14,6 +14,11 @@ Columns:
   - starttime (UTC, from parse_video_fname)
   - endtime   (UTC, from parse_video_fname)
   - cam (parsed; extra column for convenience)
+
+By default this is INCREMENTAL: per-day catalogs are cached under
+<ResultDirLocal>/bbb_fileinfo/daily/video_YYYYMMDD.parquet and a day is
+rescanned only when it has files newer than its cache (plus the N newest days,
+which are always rescanned). Use --no-use-cache for a full rescan.
 """
 
 import os
@@ -31,7 +36,12 @@ except Exception as e:
 # bb_hpc settings + filename parser
 try:
     from bb_hpc import settings
-    from bb_binary.parsing import parse_video_fname  # cam, start_dt, end_dt
+    from bb_hpc.src.fileinfo import (
+        VIDEO_INFO_COLUMNS,
+        list_video_day,
+        list_video_files_incremental,
+        _is_day_dirname,
+    )
 except Exception as e:
     print(f"ERROR: could not import required modules: {e}", file=sys.stderr)
     sys.exit(1)
@@ -65,76 +75,34 @@ def _iter_all_day_dirs(video_root: str) -> Iterable[str]:
     Yield absolute paths to top-level YYYYMMDD directories under video_root.
     (No date filtering; we scan them all.)
     """
-    def is_valid_dir(name: str) -> bool:
-        # Accept YYYYMMDD (8 digits) or YYYY-MM-DD (10 chars with hyphens at pos 4 and 7)
-        if len(name) == 8 and name.isdigit():
-            return True
-        if len(name) == 10 and name[4] == '-' and name[7] == '-':
-            y, m, d = name.split('-')
-            if y.isdigit() and m.isdigit() and d.isdigit():
-                return True
-        return False
-
     try:
         with os.scandir(video_root) as it:
             for e in it:
-                if e.is_dir(follow_symlinks=False) and is_valid_dir(e.name):
+                if e.is_dir(follow_symlinks=False) and _is_day_dirname(e.name):
                     yield e.path
     except PermissionError:
         # best-effort
         for name in os.listdir(video_root):
             p = os.path.join(video_root, name)
-            if os.path.isdir(p) and is_valid_dir(name):
+            if os.path.isdir(p) and _is_day_dirname(name):
                 yield p
-
-
-def _iter_videos_in_day(day_dir: str, exts: Tuple[str, ...]) -> Iterable[str]:
-    """
-    Walk a single day directory and yield files with extensions in 'exts' (case-insensitive).
-    """
-    exts_lower = tuple(e.lower() for e in exts)
-    for root, _, files in os.walk(day_dir):
-        for f in files:
-            if f.lower().endswith(exts_lower):
-                yield os.path.join(root, f)
-
 
 
 # -------------------------------
 # Core
 # -------------------------------
 def build_video_info_df(video_root: str, exts: Tuple[str, ...]) -> "pd.DataFrame":
-    rows = []
+    """Full (non-incremental) rescan of every day directory under video_root."""
+    frames = []
     n_days = 0
-    n_files = 0
 
     for day_dir in _iter_all_day_dirs(video_root):
         n_days += 1
-        for path in _iter_videos_in_day(day_dir, exts):
-            n_files += 1
-            fn = os.path.basename(path)
+        frames.append(list_video_day(day_dir, exts))
 
-            # Parse via bb_binary utility
-            cam = None
-            start = None
-            end = None
-            try:
-                cam, start, end = parse_video_fname(fn)  # returns (cam, start_dt, end_dt)
-            except Exception:
-                # Leave as None if unparsable
-                pass
-
-            rows.append({
-                "file_name": fn,
-                "full_path": path,
-                "starttime": start,
-                "endtime": end,
-                "cam": cam,
-            })
-
-    print(f"[scan] days={n_days}, files_seen={n_files}, files_kept={len(rows)}")
-    cols = ["file_name", "full_path", "starttime", "endtime", "cam"]
-    return pd.DataFrame(rows, columns=cols)
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=VIDEO_INFO_COLUMNS)
+    print(f"[scan] days={n_days}, files_kept={len(df)}")
+    return df
 
 
 # -------------------------------
@@ -153,6 +121,21 @@ def parse_args():
         default=None,
         help="Optional explicit parquet path. Default: <RESULTDIR_LOCAL>/bbb_fileinfo/video_info_all.parquet",
     )
+    p.add_argument(
+        "--use-cache",
+        dest="use_cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reuse per-day caches, rescanning only changed days (default: true). "
+             "Use --no-use-cache to force a full rescan of every day.",
+    )
+    p.add_argument(
+        "--force-recent-days",
+        type=int,
+        default=2,
+        help="Always rescan the N newest day directories, even if their cache looks fresh. "
+             "Only meaningful with --use-cache.",
+    )
     return p.parse_args()
 
 
@@ -167,8 +150,19 @@ def main():
     print(f"[config] ResultDirLocal= {resultdir}")
     print(f"[config] cache_dir     = {cache_dir}")
     print(f"[config] exts          = {args.exts}")
+    print(f"[config] use_cache     = {args.use_cache}")
+    if args.use_cache:
+        print(f"[config] force_recent  = {args.force_recent_days} day(s)")
 
-    df = build_video_info_df(video_root, tuple(args.exts))
+    if args.use_cache:
+        df = list_video_files_incremental(
+            video_root,
+            cache_dir,
+            exts=tuple(args.exts),
+            force_recent_days=args.force_recent_days,
+        )
+    else:
+        df = build_video_info_df(video_root, tuple(args.exts))
     print(f"[videoinfo] collected {len(df)} files")
 
     out_path = args.outfile or os.path.join(cache_dir, "video_info_all.parquet")
