@@ -34,9 +34,9 @@ def job_for_process_videos(
       a clean file (its add() truncates, so there is no duplicate-frame append).
       A video counts as successful only when its primary .bbb exists and is
       non-zero. If any video still fails, the failed source paths are written
-      under `failure_list_dir` (default <repo>/_detect_failures) and the function
-      exits non-zero so the k8s/Slurm job is marked Failed and retried — mirroring
-      the other chunk runners in this file.
+      under `failure_list_dir` (default: a `detect_failures` dir *beside* the repo
+      root, never inside it) and the function exits non-zero so the k8s/Slurm job
+      is marked Failed and retried — mirroring the other chunk runners in this file.
     - If skip_existing=True, a video whose primary .bbb already exists and is
       non-zero is skipped, so a whole-pod retry redoes only the missing ones.
     """
@@ -54,6 +54,15 @@ def job_for_process_videos(
             p.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
+
+    def _default_failure_list_dir(repo_root):
+        # Must land beside the bb_binary repo root, never inside it: Repository's
+        # directory walk takes min()/max() over every subdirectory and int()-parses
+        # the winner, so one non-numeric entry at the root breaks every read.
+        # abspath first -- repo_root usually ends in '/', and dirname() of that
+        # returns the root itself.
+        root = os.path.abspath(repo_root)
+        return os.path.join(os.path.dirname(root), "detect_failures")
 
     def _copy_file(src: Path, dst: Path):
         _safe_makedirs(dst.parent)
@@ -272,7 +281,7 @@ def job_for_process_videos(
         # Durable failure record — pod logs are the only other evidence and they
         # vanish on GC. Never let a write error here mask the non-zero exit.
         try:
-            fdir = failure_list_dir or os.path.join(repo_output_path, "_detect_failures")
+            fdir = failure_list_dir or _default_failure_list_dir(repo_output_path)
             _safe_makedirs(Path(fdir))
             idx = os.environ.get("JOB_COMPLETION_INDEX", "x")
             worker = shard_tag or os.getpid()
@@ -295,6 +304,30 @@ def job_for_save_detect_chunk(job_args_list):
     Process a list of one-hour detection segments in a single task.
     Each element in job_args_list is a dict of kwargs for save_all_detections.
     """
+
+    # ---- Guard: bb_binary's repo walk int()-parses every directory name ----
+    # Repository._get_directory takes min()/max() over *all* subdirectories of the
+    # repo root and int()-parses the winner, with no name filter, so one stray
+    # non-numeric dir there makes every read raise ValueError. _DIR_FORMAT is
+    # all-numeric at every level, so narrowing the walk to digit names is safe.
+    try:
+        import os as _os
+        from bb_binary.repository import Repository as _Repo
+        if not getattr(_Repo, "_bbhpc_numeric_dirs", False):
+            def _numeric_get_directory(self, selection_fn):
+                def directories(dirname):
+                    return [_os.path.join(dirname, d) for d in _os.listdir(dirname)
+                            if d.isdigit() and _os.path.isdir(_os.path.join(dirname, d))]
+                current_dir = self.root_dir
+                while True:
+                    dirs = directories(current_dir)
+                    if not dirs:
+                        return current_dir
+                    current_dir = selection_fn(dirs)
+            _Repo._get_directory = _numeric_get_directory
+            _Repo._bbhpc_numeric_dirs = True
+    except Exception as e:
+        print(f"[save_detect] bb_binary numeric-dir guard not installed: {e}", flush=True)
 
     def save_all_detections(repo_path, save_path, from_dt, to_dt, cam_id):
         """
@@ -484,6 +517,32 @@ def job_for_tracking_chunk(job_args_list):
         # use the same file-name generating function used by bb_binary
         from bb_binary.parsing import get_video_fname
 
+        # ---- Guard: bb_binary's repo walk int()-parses every directory name ----
+        # Repository._get_directory takes min()/max() over *all* subdirectories of the
+        # repo root and int()-parses the winner's path components, with no name filter.
+        # One stray non-numeric dir there (a _detect_failures, a lost+found, an NFS
+        # .snapshot) therefore makes every read raise ValueError, before any camera or
+        # time-window filtering. _DIR_FORMAT is all-numeric at every level, so narrowing
+        # the walk to digit names is safe. Patched on the class, guarded by a marker so
+        # repeated windows in a chunk install it once.
+        try:
+            from bb_binary.repository import Repository as _Repo
+            if not getattr(_Repo, "_bbhpc_numeric_dirs", False):
+                def _numeric_get_directory(self, selection_fn):
+                    def directories(dirname):
+                        return [os.path.join(dirname, d) for d in os.listdir(dirname)
+                                if d.isdigit() and os.path.isdir(os.path.join(dirname, d))]
+                    current_dir = self.root_dir
+                    while True:
+                        dirs = directories(current_dir)
+                        if not dirs:
+                            return current_dir
+                        current_dir = selection_fn(dirs)
+                _Repo._get_directory = _numeric_get_directory
+                _Repo._bbhpc_numeric_dirs = True
+        except Exception as e:
+            print(f"[tracking] bb_binary numeric-dir guard not installed: {e}", flush=True)
+
         # ---- Compatibility patch for legacy repos with duplicate segments (no symlinks) ----
         # For newer repos this is a no-op (timestamps are already monotonic).
         try:
@@ -497,6 +556,7 @@ def job_for_tracking_chunk(job_args_list):
             import numpy as _np
             import datetime as _dt
             import pytz as _pytz
+            import traceback as _traceback
 
             def _iter_wrap(repository_path, dt_begin, dt_end, homography_fn=None, **kwargs):
                 """
@@ -560,8 +620,14 @@ def job_for_tracking_chunk(job_args_list):
                         prev_cam = cam_id_it
                         prev_frame_id = frame_id
 
-                except Exception:
-                    # Fallback: pass-through with per-frame monotonic guard
+                except Exception as e1:
+                    # Fallback: pass-through with per-frame monotonic guard.
+                    # Log every tier: a deterministic failure (e.g. a repo the walk
+                    # cannot parse) raises identically in all three, and silence here
+                    # makes that look like three unrelated errors.
+                    print(f"[_iter_wrap] tier 1 (dedup) failed, retrying pass-through: "
+                          f"{type(e1).__name__}: {e1}", flush=True)
+                    _traceback.print_exc()
                     last_ts_by_cam = {}
                     try:
                         gen2 = _orig_iterate(repository_path, dt_begin, dt_end, homography_fn, **kwargs)
@@ -572,8 +638,12 @@ def job_for_tracking_chunk(job_args_list):
                                 continue
                             last_ts_by_cam[cam_id_it] = ts
                             yield (cam_id_it, frame_id, frame_dt, frame_detections, frame_kdtree)
-                    except Exception:
-                        # Last resort: yield original without changes
+                    except Exception as e2:
+                        # Last resort: yield original without changes. If this raises too,
+                        # the error is not transient and propagates to _track_one.
+                        print(f"[_iter_wrap] tier 2 (pass-through) failed, retrying raw: "
+                              f"{type(e2).__name__}: {e2}", flush=True)
+                        _traceback.print_exc()
                         gen3 = _orig_iterate(repository_path, dt_begin, dt_end, homography_fn, **kwargs)
                         for item in gen3:
                             yield item
@@ -659,7 +729,7 @@ def job_for_tracking_chunk(job_args_list):
             dill.dump(batch, results_file)
 
         success = False
-        had_iterator_error = False
+        iterator_error = None
         had_track_error = False
         tracks_written = 0
         try:
@@ -677,8 +747,12 @@ def job_for_tracking_chunk(job_args_list):
                     except MemoryError:
                         raise
                     except Exception as e:
-                        had_iterator_error = True
-                        print(f"Error occurred while retrieving the next track: {e}")
+                        # A generator that raised is dead: calling next() again only
+                        # yields StopIteration, which would look like a clean finish.
+                        # This is fatal for the window, not a per-track hiccup.
+                        iterator_error = e
+                        print(f"FATAL iterator error cam={cam_id} {from_dt} -> {to_dt}: "
+                              f"{type(e).__name__}: {e}")
                         import traceback; traceback.print_exc()
                         if hasattr(track, 'detections'):
                             for det in track.detections[:5]:
@@ -691,7 +765,7 @@ def job_for_tracking_chunk(job_args_list):
                                           getattr(det, "y_pixels", None))
                                 except Exception:
                                     print("Det:<unprintable>")
-                        continue
+                        break
                     try:
                         process_track(track, cam_id, results_file)
                         tracks_written += 1
@@ -699,21 +773,36 @@ def job_for_tracking_chunk(job_args_list):
                         raise
                     except Exception as e:
                         had_track_error = True
-                        print(f"Error processing track {track.id}: {e}")
+                        print(f"Error processing track {getattr(track, 'id', '?')}: {e}")
                         if hasattr(track, 'timestamps'):
                             print(f"Timestamps: {track.timestamps}")
                         continue
         finally:
-            # Restore the original scipy.spatial.cKDTree so the patch does not
-            # leak to other jobs running in the same process.
+            # Restore the patched globals so they do not leak to other jobs in this
+            # process, and so the next window does not wrap the wrapper.
             _sp_spatial.cKDTree = _orig_ckdtree
+            if _orig_iterate is not None:
+                _dw.iterate_bb_binary_repository = _orig_iterate
 
         try:
             tmp_size = os.path.getsize(output_filename_tmp)
         except OSError:
             tmp_size = 0
 
-        if success and not had_iterator_error and tmp_size > 0:
+        if iterator_error is not None:
+            try:
+                os.remove(output_filename_tmp)
+            except Exception:
+                pass
+            print(
+                f"tracking FAILED: fatal iterator error cam={cam_id} {from_dt} -> {to_dt}: "
+                f"{type(iterator_error).__name__}: {iterator_error}; "
+                f"tracks before death={tracks_written}; tmp removed: {output_filename_tmp}"
+            )
+            import sys
+            sys.exit(1)
+
+        if success and tmp_size > 0:
             shutil.move(output_filename_tmp, output_filename)
             print(f"tracking done: tracks={tracks_written} had_track_error={had_track_error} -> {output_filename}")
         else:
@@ -722,7 +811,7 @@ def job_for_tracking_chunk(job_args_list):
             except Exception:
                 pass
             print(
-                f"tracking FAILED: success={success} had_iterator_error={had_iterator_error} "
+                f"tracking FAILED: success={success} "
                 f"had_track_error={had_track_error} tracks={tracks_written} tmp_size={tmp_size}; "
                 f"tmp removed: {output_filename_tmp}"
             )

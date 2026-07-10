@@ -5,6 +5,9 @@ Hermetic tests for the detect-robustness hardening (no bb_binary/pipeline needed
 Covers:
 - job_for_process_videos retry + clean-slate + post-write validation + runtime
   skip + durable failure list + sys.exit(1)  (src/jobfunctions.py)
+- the durable failure list lands *beside* the bb_binary repo root, never inside
+  it, and assert_clean_repo_root rejects a root that already holds a stray dir
+  (src/jobfunctions.py, src/repo_guard.py)
 - is_bbb_file_valid_basicmatch rejects 0-byte even with check_read_file=False
   (src/fileinfo.py)
 - check_symlinks_and_fill_in._source_is_valid 0-byte guard
@@ -182,11 +185,41 @@ def _run(repo, videos, **kw):
     return job_for_process_videos(video_paths=videos, repo_output_path=repo, **kw)
 
 
+def _mkrepo():
+    """Build <parent>/pipeline_repo and return both.
+
+    The default failure-list dir is a *sibling* of the repo root, so the repo must
+    have a dedicated parent: with a bare mkdtemp() repo the sibling would be the
+    shared system temp dir, where one test's failure list would leak into the next
+    test's absence assertions.
+    """
+    parent = tempfile.mkdtemp()
+    repo = os.path.join(parent, "pipeline_repo")
+    os.makedirs(repo)
+    return parent, repo
+
+
+def _failure_dir(repo):
+    """Mirror of job_for_process_videos' default: a sibling of the repo root."""
+    return Path(os.path.dirname(os.path.abspath(repo)), "detect_failures")
+
+
+def _assert_repo_root_clean(repo):
+    """The repo root must contain only bb_binary's numeric YYYY buckets.
+
+    bb_binary int()-parses every directory name at the root, so anything else
+    there breaks all reads (see src/repo_guard.py).
+    """
+    stray = sorted(d for d in os.listdir(repo)
+                   if not d.isdigit() and os.path.isdir(os.path.join(repo, d)))
+    assert not stray, f"non-numeric dirs in repo root would break bb_binary reads: {stray}"
+
+
 # --------------------------------------------------------------------------- #
 # tests
 # --------------------------------------------------------------------------- #
 def test_transient_failure_is_retried_and_succeeds():
-    repo = tempfile.mkdtemp()
+    parent, repo = _mkrepo()
     try:
         _reset(fail_set={1})  # first attempt EIO, second OK
         name = _video_name()
@@ -196,14 +229,15 @@ def test_transient_failure_is_retried_and_succeeds():
         assert _STATE["calls"] == 2, "should have retried exactly once"
         assert os.path.getsize(primary) > 0, "primary must be non-zero after retry"
         assert os.path.getsize(primary) == len("DETECTIONS"), "no double-append"
-        assert not Path(repo, "_detect_failures").exists(), "no failure file on success"
+        assert not _failure_dir(repo).exists(), "no failure file on success"
+        _assert_repo_root_clean(repo)
         print("ok: transient failure retried and succeeded")
     finally:
-        shutil.rmtree(repo, ignore_errors=True)
+        shutil.rmtree(parent, ignore_errors=True)
 
 
 def test_persistent_failure_exits_nonzero_and_records():
-    repo = tempfile.mkdtemp()
+    parent, repo = _mkrepo()
     try:
         _reset(fail_all=True)
         name = _video_name()
@@ -219,19 +253,73 @@ def test_persistent_failure_exits_nonzero_and_records():
         # primary left absent or 0-byte (never a bogus non-zero file)
         primary = _expected_primary(repo, name)
         assert (not os.path.exists(primary)) or os.path.getsize(primary) == 0
-        # durable failure list written with the source path
-        fdir = Path(repo, "_detect_failures")
+        # durable failure list written with the source path, beside the repo root
+        fdir = _failure_dir(repo)
         files = list(fdir.glob("detect_failures_*.txt")) if fdir.exists() else []
-        assert files, "expected a durable failure-list file"
+        assert files, f"expected a durable failure-list file under {fdir}"
         body = files[0].read_text()
         assert src in body
         print("ok: persistent failure exits 1 and records failure list")
     finally:
-        shutil.rmtree(repo, ignore_errors=True)
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def test_failure_list_default_is_outside_repo_root():
+    """Regression: a failure list inside the repo root breaks every bb_binary read.
+
+    `_detect_failures` used to be written to <repo>/_detect_failures. Because '_'
+    sorts above every digit, Repository._get_directory(max) selected it as the
+    "latest path" and int()-parsed it, so tracking and save_detect died with
+    ValueError: invalid literal for int() with base 10: '_detect_failures'.
+    """
+    parent, repo = _mkrepo()
+    try:
+        _reset(fail_all=True)
+        name = _video_name()
+        src = str(Path(repo) / name)
+        try:
+            _run(repo, [src], max_attempts=1, failure_list_dir=None)
+        except SystemExit:
+            pass
+
+        _assert_repo_root_clean(repo)
+        assert not Path(repo, "_detect_failures").exists(), \
+            "failure list must never be written inside the bb_binary repo root"
+        assert not Path(repo, "detect_failures").exists(), \
+            "not even under a numeric-safe name -- it still is not a timestamp dir"
+
+        fdir = _failure_dir(repo)
+        assert fdir.is_dir(), f"failure list should be a sibling of the repo root, at {fdir}"
+        files = list(fdir.glob("detect_failures_*.txt"))
+        assert files, "sibling failure dir should hold the recorded failure"
+        assert src in files[0].read_text()
+        print("ok: default failure list lands beside the repo root, not inside it")
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def test_explicit_failure_list_dir_is_honored():
+    parent, repo = _mkrepo()
+    try:
+        _reset(fail_all=True)
+        name = _video_name()
+        src = str(Path(repo) / name)
+        explicit = Path(parent, "somewhere_else")
+        try:
+            _run(repo, [src], max_attempts=1, failure_list_dir=str(explicit))
+        except SystemExit:
+            pass
+        files = list(explicit.glob("detect_failures_*.txt"))
+        assert files, f"explicit failure_list_dir {explicit} should have been used"
+        assert src in files[0].read_text()
+        assert not _failure_dir(repo).exists(), "explicit dir should override the default"
+        print("ok: explicit failure_list_dir overrides the default")
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
 
 
 def test_skip_existing_skips_nonzero_primary():
-    repo = tempfile.mkdtemp()
+    parent, repo = _mkrepo()
     try:
         _reset()
         name = _video_name()
@@ -244,11 +332,11 @@ def test_skip_existing_skips_nonzero_primary():
         assert _STATE["calls"] == 0, "non-zero primary should be skipped, process_video not called"
         print("ok: skip_existing skips a non-zero primary")
     finally:
-        shutil.rmtree(repo, ignore_errors=True)
+        shutil.rmtree(parent, ignore_errors=True)
 
 
 def test_zero_byte_primary_is_not_skipped():
-    repo = tempfile.mkdtemp()
+    parent, repo = _mkrepo()
     try:
         _reset()  # processing succeeds this time
         name = _video_name()
@@ -261,7 +349,7 @@ def test_zero_byte_primary_is_not_skipped():
         assert os.path.getsize(primary) > 0
         print("ok: 0-byte primary is reprocessed, not skipped")
     finally:
-        shutil.rmtree(repo, ignore_errors=True)
+        shutil.rmtree(parent, ignore_errors=True)
 
 
 def test_is_bbb_basicmatch_rejects_zero_byte():
@@ -299,7 +387,7 @@ def test_fillin_source_guard_rejects_zero_byte():
 
 
 def test_boundary_symlink_eio_writes_primary_and_copies():
-    repo = tempfile.mkdtemp()
+    parent, repo = _mkrepo()
     real_symlink = os.symlink
     bbp = sys.modules["pipeline.scripts.bb_pipeline"]
     saved_pv = bbp.process_video
@@ -322,16 +410,17 @@ def test_boundary_symlink_eio_writes_primary_and_copies():
         assert os.path.getsize(primary) > 0, "primary must be written despite the symlink EIO"
         assert os.path.exists(secondary) and os.path.getsize(secondary) > 0, \
             "cross-boundary entry must be materialized as a real copy"
-        assert not Path(repo, "_detect_failures").exists(), "no failure on a tolerated symlink"
+        assert not _failure_dir(repo).exists(), "no failure on a tolerated symlink"
+        _assert_repo_root_clean(repo)
         print("ok: boundary symlink EIO -> primary written + cross-boundary copy created")
     finally:
         os.symlink = real_symlink
         bbp.process_video = saved_pv
-        shutil.rmtree(repo, ignore_errors=True)
+        shutil.rmtree(parent, ignore_errors=True)
 
 
 def test_materialize_overwrites_zero_byte_secondary():
-    repo = tempfile.mkdtemp()
+    parent, repo = _mkrepo()
     real_symlink = os.symlink
     bbp = sys.modules["pipeline.scripts.bb_pipeline"]
     saved_pv = bbp.process_video
@@ -356,18 +445,71 @@ def test_materialize_overwrites_zero_byte_secondary():
     finally:
         os.symlink = real_symlink
         bbp.process_video = saved_pv
-        shutil.rmtree(repo, ignore_errors=True)
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def test_repo_guard_rejects_stray_root_dir():
+    from bb_hpc.src.repo_guard import assert_clean_repo_root, stray_repo_root_dirs
+
+    parent, repo = _mkrepo()
+    try:
+        os.makedirs(os.path.join(repo, "2026", "06", "10"))
+        assert stray_repo_root_dirs(repo) == []
+        assert_clean_repo_root(repo)  # clean root: must not raise
+
+        # bb_binary's own config file is a file, not a dir -- already harmless.
+        open(os.path.join(repo, ".bbb_repo_config.json"), "w").close()
+        assert stray_repo_root_dirs(repo) == []
+
+        os.makedirs(os.path.join(repo, "_detect_failures"))
+        assert stray_repo_root_dirs(repo) == ["_detect_failures"]
+        raised = None
+        try:
+            assert_clean_repo_root(repo)
+        except SystemExit as e:
+            raised = e
+        assert raised is not None, "a stray root dir must be rejected at submit time"
+        assert "_detect_failures" in str(raised.code)
+        print("ok: repo_guard rejects a stray dir in the repo root")
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def test_stray_root_dir_poisons_both_ends_of_the_sort():
+    """Why the failure dir must move *out*, not be renamed or hidden.
+
+    Repository._get_directory takes max() for the latest path and min() for the
+    earliest, over the raw child names. '_' (0x5F) sorts above every digit and a
+    leading '.' (0x2E) sorts below, so neither an underscore nor a dot escapes --
+    one poisons _get_latest_path, the other _get_earliest_path.
+    """
+    years = ["2025", "2026"]
+    assert max(years + ["_detect_failures"]) == "_detect_failures"
+    assert min(years + [".detect_failures"]) == ".detect_failures"
+    # and both are unparseable as a bb_binary timestamp component
+    for bad in ("_detect_failures", ".detect_failures"):
+        raised = None
+        try:
+            int(bad)
+        except ValueError as e:
+            raised = e
+        assert raised is not None
+    print("ok: stray dirs poison max() and min() alike -- move them out of the root")
 
 
 _TESTS = [
     test_transient_failure_is_retried_and_succeeds,
     test_persistent_failure_exits_nonzero_and_records,
+    test_failure_list_default_is_outside_repo_root,
+    test_explicit_failure_list_dir_is_honored,
     test_skip_existing_skips_nonzero_primary,
     test_zero_byte_primary_is_not_skipped,
     test_is_bbb_basicmatch_rejects_zero_byte,
     test_fillin_source_guard_rejects_zero_byte,
     test_boundary_symlink_eio_writes_primary_and_copies,
     test_materialize_overwrites_zero_byte_secondary,
+    test_repo_guard_rejects_stray_root_dir,
+    test_stray_root_dir_poisons_both_ends_of_the_sort,
 ]
 
 

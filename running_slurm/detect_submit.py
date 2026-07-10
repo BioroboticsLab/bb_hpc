@@ -9,6 +9,18 @@ from bb_hpc.src.jobfunctions import job_for_process_videos
 from bb_hpc.src.slurm_utils import resolve_slurm_config, apply_slurm_to_job, run_jobs_and_log
 
 
+# Per-video robustness knobs that job_for_process_videos accepts as kwargs. The k8s/docker
+# runner (running_k8s/run_videos.py) reads these straight from settings; slurm goes through
+# job.map(), so they have to be folded into each generated work item instead.
+_DETECT_OPTS = ("max_attempts", "retry_backoff_sec", "skip_existing", "failure_list_dir")
+
+
+def _with_detect_opts(jobs, s):
+    extra = {k: s[k] for k in _DETECT_OPTS if k in s}
+    for j in jobs:
+        yield {**j, **extra}
+
+
 # usage: python detect_submit.py --dates 20250710 20250709 ...
 def parse_args():
     now = datetime.now(timezone.utc)
@@ -60,17 +72,20 @@ def main():
     # Map function over generated work items
     job.map(
         job_for_process_videos,
-        generate_jobs_detect(
-            video_root_dir=str(videodir),
-            repo_output_path=str(pipeline_root),
-            slurmdir=slurmdir,
-            chunk_size=chunk_size,
-            maxjobs=maxjobs,
-            datestring=args.dates,
-            verbose=False,
-            RESULTDIR=resultdir,
-            use_fileinfo=bool(args.use_fileinfo),
-            check_read_bbb=bool(args.check_read_bbb),
+        _with_detect_opts(
+            generate_jobs_detect(
+                video_root_dir=str(videodir),
+                repo_output_path=str(pipeline_root),
+                slurmdir=slurmdir,
+                chunk_size=chunk_size,
+                maxjobs=maxjobs,
+                datestring=args.dates,
+                verbose=False,
+                RESULTDIR=resultdir,
+                use_fileinfo=bool(args.use_fileinfo),
+                check_read_bbb=bool(args.check_read_bbb),
+            ),
+            s,
         )
     )
 

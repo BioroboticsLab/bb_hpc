@@ -240,6 +240,146 @@ def generate_jobs_detect(
 
 
 #################################################################
+##### SHARED COMPLETION PREDICATES (hourly-window stages)
+#################################################################
+# These are the single source of truth for "is this (cam, hour) work unit done?".
+# generate_jobs_save_detect / generate_jobs_tracking build their job dicts from
+# window_candidates(); bb_hpc.src.progress reports on the same records. Keeping
+# one implementation is what stops the progress report from drifting away from
+# what the submitters actually schedule.
+#
+# All functions here are WRITE-FREE, so a read-only report can call them.
+
+_CAM_RE = r"^[Cc]am[_-](\d+)"
+
+
+def _parse_cam_id(file_name):
+    """cam_id from a video/.bbb basename; None when unparsable."""
+    try:
+        return int(parse_video_fname(str(file_name))[0])
+    except Exception:
+        return None
+
+
+def ensure_cam_id(df, column="file_name"):
+    """
+    Return a copy of df with an int cam_id column.
+
+    The bbb catalog (list_bbb_files) does not store cam_id, and its incremental
+    daily cache is trusted on mtime alone -- so a cached cam_id column would be a
+    silent mix of real values and NaN. We always derive it here instead: one
+    vectorized regex over the filename, falling back to parse_video_fname only
+    for the rows the regex misses.
+    """
+    if "cam_id" in df.columns and df["cam_id"].notna().all():
+        return df
+
+    df = df.copy()
+    cam = pd.to_numeric(
+        df[column].astype(str).str.extract(_CAM_RE, expand=False), errors="coerce"
+    )
+    missing = cam.isna()
+    if missing.any():
+        cam.loc[missing] = df.loc[missing, column].map(_parse_cam_id)
+    df["cam_id"] = cam
+    return df
+
+
+def hour_windows(dates, interval_hours=1):
+    """
+    Hour-aligned [start, end) windows covering each YYYYMMDD date (UTC), oldest first.
+
+    Both generate_jobs_save_detect and generate_jobs_tracking previously built
+    these independently; for interval_hours=1 they produced identical windows.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    interval = timedelta(hours=int(interval_hours))
+    if interval.total_seconds() <= 0:
+        raise ValueError("interval_hours must be positive")
+
+    days = list(dates) if isinstance(dates, (list, tuple)) else [dates]
+    windows = []
+    for d in days:
+        day_start = datetime.strptime(str(d), "%Y%m%d").replace(tzinfo=timezone.utc)
+        day_end = day_start + timedelta(days=1)
+        cur = day_start
+        while cur < day_end:
+            win_end = min(day_end, cur + interval)
+            if win_end > cur:
+                windows.append((cur, win_end))
+            cur += interval
+    windows.sort(key=lambda w: w[0])
+    return windows
+
+
+def build_out_index(df_out):
+    """(cam_id, from_dt, to_dt) -> modified_time, from a *_outinfo.parquet frame."""
+    if df_out is None or len(df_out) == 0:
+        return {}
+    return dict(
+        zip(
+            zip(df_out["cam_id"], df_out["from_dt"], df_out["to_dt"]),
+            df_out["modified_time"],
+        )
+    )
+
+
+def window_candidates(df_bbb, out_index, dates, interval_hours=1):
+    """
+    Classify every (cam_id, hour-window) work unit implied by the BBB catalog.
+
+    A window is *expected* for a camera when at least one .bbb OVERLAPS it
+    (starttime < win_end AND endtime > win_start). Note this is an overlap test on
+    both ends, not a floor() of starttime: a .bbb spanning an hour boundary belongs
+    to BOTH hours, and the submitters schedule it in both.
+
+    Returns one dict per expected unit:
+        cam_id, from_dt, to_dt, latest_src_mtime, out_mtime, status
+    where status is:
+        'missing' -- no output exists
+        'stale'   -- output is older than the newest .bbb in the window
+        'done'    -- output exists and is at least as new as every source .bbb
+
+    Units with status != 'done' are exactly what the generators schedule.
+    """
+    if df_bbb is None or len(df_bbb) == 0:
+        return []
+
+    df_bbb = ensure_cam_id(df_bbb)
+    df_bbb = df_bbb.dropna(subset=["cam_id", "starttime", "endtime"])
+
+    out = []
+    for win_start, win_end in hour_windows(dates, interval_hours):
+        sel = df_bbb[(df_bbb["starttime"] < win_end) & (df_bbb["endtime"] > win_start)]
+        if sel.empty:
+            continue
+
+        for cam_id, subset in sel.groupby("cam_id"):
+            latest_src = subset["modified_time"].max()
+            existing = out_index.get((int(cam_id), win_start, win_end))
+
+            if existing is None:
+                status = "missing"
+            elif latest_src > existing:
+                status = "stale"
+            else:
+                status = "done"
+
+            out.append({
+                "cam_id": int(cam_id),
+                "from_dt": win_start,
+                "to_dt": win_end,
+                "latest_src_mtime": latest_src,
+                "out_mtime": existing,
+                "status": status,
+            })
+
+    out.sort(key=lambda u: (u["from_dt"], u["cam_id"]))
+    return out
+
+
+#################################################################
 ##### SAVE DETECT (date-based, daily windows)
 #################################################################
 def generate_jobs_save_detect(
@@ -260,8 +400,6 @@ def generate_jobs_save_detect(
     """
     import os, glob
     import pandas as pd
-    from datetime import datetime, timedelta, timezone
-    from bb_binary import parse_video_fname
 
     # Where aggregated parquet outputs live
     save_dir = os.path.join(RESULTDIR, 'data_alldetections/')
@@ -278,75 +416,17 @@ def generate_jobs_save_detect(
     df_bbb = pd.read_parquet(sorted(glob.glob(bbb_info_glob))[-1])   # latest snapshot
     df_out = pd.read_parquet(detect_cache_file)
 
-    # Map of already-produced windows: (cam_id, from_dt, to_dt) -> modified_time
-    out_index = {
-        (r['cam_id'], r['from_dt'], r['to_dt']): r['modified_time']
-        for _, r in df_out.iterrows()
-    }
-
-    # Ensure cam_id exists in df_bbb (derive from filename if needed)
-    if 'cam_id' not in df_bbb.columns:
-        try:
-            df_bbb = df_bbb.copy()
-            df_bbb['cam_id'] = df_bbb['file_name'].apply(lambda fn: parse_video_fname(fn)[0])
-        except Exception:
-            # Fallback: try to parse simple "cam-<id>_..." prefixes
-            import re
-            def _fallback_cam(fn):
-                m = re.match(r'(?:cam-)?(\d+)_', fn)
-                return int(m.group(1)) if m else -1
-            df_bbb = df_bbb.copy()
-            df_bbb['cam_id'] = df_bbb['file_name'].apply(_fallback_cam)
-
-    # Build daily windows from datestring
-    def _to_utc_day(dstr: str):
-        dt0 = datetime.strptime(dstr, "%Y%m%d").replace(tzinfo=timezone.utc)
-        return dt0, dt0 + timedelta(days=1)
-
-    # Hourly (or configurable) windows within a day
-    interval = timedelta(hours=int(interval_hours))
-    if interval.total_seconds() <= 0:
-        raise ValueError("interval_hours must be positive")
-
-    def _iter_windows(day_start, day_end):
-        t = day_start
-        while t < day_end:
-            nxt = min(t + interval, day_end)
-            yield t, nxt
-            t = nxt
-
-    # Collect candidates (per-date, per-cam) where:
-    # - there is at least one repo file overlapping that day for that cam
-    # - output either missing or older than latest source
-    candidates = []
-    for d in datestring:
-        day_start, day_end = _to_utc_day(d)
-        # Videos overlapping this day window
-        sel = df_bbb[(df_bbb['starttime'] < day_end) & (df_bbb['endtime'] > day_start)]
-        if sel.empty:
-            continue
-
-        for cam_id, subset in sel.groupby('cam_id'):
-            for win_start, win_end in _iter_windows(day_start, day_end):
-                # Only schedule windows that overlap at least one repo file
-                window_data = subset[(subset['starttime'] < win_end) & (subset['endtime'] > win_start)]
-                if window_data.empty:
-                    continue
-
-                latest_src = window_data['modified_time'].max()
-                key = (cam_id, win_start, win_end)
-                existing = out_index.get(key)
-                if (existing is None) or (latest_src > existing):
-                    candidates.append({
-                        'repo_path': PIPELINE_ROOT,
-                        'save_path': save_dir,
-                        'from_dt':   win_start,
-                        'to_dt':     win_end,
-                        'cam_id':    cam_id,
-                    })
-
-    # Sort date-ordered (by from_dt) then cam_id
-    candidates.sort(key=lambda x: (x['from_dt'], x['cam_id']), reverse=False)
+    units = window_candidates(df_bbb, build_out_index(df_out), datestring, interval_hours)
+    candidates = [
+        {
+            'repo_path': PIPELINE_ROOT,
+            'save_path': save_dir,
+            'from_dt':   u['from_dt'],
+            'to_dt':     u['to_dt'],
+            'cam_id':    u['cam_id'],
+        }
+        for u in units if u['status'] != 'done'
+    ]
 
     # Optional cap like detect(): only keep first chunk_size * maxjobs
     if maxjobs is not None:
@@ -388,8 +468,6 @@ def generate_jobs_tracking(
     """
     import os, glob
     import pandas as pd
-    from datetime import datetime, timedelta, timezone
-    from bb_binary.parsing import parse_video_fname
 
     # ---- Paths (from settings via args) ----
     save_dir = os.path.join(RESULTDIR, "data_tracked")
@@ -407,79 +485,19 @@ def generate_jobs_tracking(
     df_bbb = pd.read_parquet(info_files[-1])          # latest snapshot
     df_out = pd.read_parquet(track_cache_file)
 
-    # Ensure we have cam_id in df_bbb
-    if "cam_id" not in df_bbb.columns:
-        try:
-            df_bbb = df_bbb.copy()
-            df_bbb["cam_id"] = df_bbb["file_name"].apply(lambda fn: parse_video_fname(fn)[0])
-        except Exception:
-            # very conservative fallback (cam-<id>_...)
-            import re
-            def _fallback_cam(fn):
-                m = re.match(r"(?:cam-)?(\d+)_", str(fn))
-                return int(m.group(1)) if m else -1
-            df_bbb = df_bbb.copy()
-            df_bbb["cam_id"] = df_bbb["file_name"].apply(_fallback_cam)
-
-    # Build “already produced” index
-    out_index = {
-        (row["cam_id"], row["from_dt"], row["to_dt"]): row["modified_time"]
-        for _, row in df_out.iterrows()
-    }
-
-    # ---- Build hourly windows across the requested dates (UTC) ----
-    interval = timedelta(hours=int(interval_hours))
-
-    def _day_bounds_utc(yyyymmdd: str):
-        # Full UTC day window [00:00, 24:00) and already hour-aligned
-        start = datetime.strptime(yyyymmdd, "%Y%m%d").replace(tzinfo=timezone.utc)
-        end   = start + timedelta(days=1)
-        return start, end
-
-    windows = []  # list of (win_start, win_end)
-    for d in datestring:
-        day_start, day_end = _day_bounds_utc(d)
-        cur = day_start
-        while cur < day_end:
-            win_start = cur
-            win_end   = min(day_end, cur + interval)
-            # Hour alignment (defensive; day_start/day_end already hour-aligned)
-            win_start = (pd.Timestamp(win_start).floor("h")).to_pydatetime().replace(tzinfo=timezone.utc)
-            win_end   = (pd.Timestamp(win_end).floor("h")).to_pydatetime().replace(tzinfo=timezone.utc)
-            if win_end > win_start:
-                windows.append((win_start, win_end))
-            cur += interval
-
-    # Sort oldest-first, to process in order (note: reverse=False would process newest first)
-    windows.sort(key=lambda w: w[0], reverse=False)
-
-    # ---- Collect candidates: per-hour per-cam if missing/stale ----
-    candidates = []
-    for win_start, win_end in windows:
-        sel = df_bbb[(df_bbb["starttime"] < win_end) & (df_bbb["endtime"] > win_start)]
-        if sel.empty:
-            continue
-
-        for cam_id, subset in sel.groupby("cam_id"):
-            if subset.empty:
-                continue
-
-            latest_src = subset["modified_time"].max()
-            key = (cam_id, win_start, win_end)
-            existing = out_index.get(key)
-
-            if (existing is None) or (latest_src > existing):
-                candidates.append({
-                    "repo_path": PIPELINE_ROOT,
-                    "save_path": save_dir,
-                    "temp_path": TEMP_DIR,  
-                    "from_dt":   win_start,
-                    "to_dt":     win_end,
-                    "cam_id":    cam_id,
-                })
-
-    # Oldest-first, stable by cam_id
-    candidates.sort(key=lambda x: (x["from_dt"], x["cam_id"]), reverse=False)
+    windows = hour_windows(datestring, interval_hours)
+    units = window_candidates(df_bbb, build_out_index(df_out), datestring, interval_hours)
+    candidates = [
+        {
+            "repo_path": PIPELINE_ROOT,
+            "save_path": save_dir,
+            "temp_path": TEMP_DIR,
+            "from_dt":   u["from_dt"],
+            "to_dt":     u["to_dt"],
+            "cam_id":    u["cam_id"],
+        }
+        for u in units if u["status"] != "done"
+    ]
 
     # Optional cap to first chunk_size * maxjobs
     if maxjobs is not None:
@@ -598,8 +616,99 @@ def generate_jobs_rpi_detect(
 
 
 #################################################################
+##### CELL-SEG SHARED HELPERS (frame_extract + background)
+#################################################################
+# Single source of truth for "is this (date, cam) unit done?". The generators
+# below and bb_hpc.src.progress both call these, so a progress report can never
+# disagree with what the submitters actually schedule.
+#
+# All functions here are WRITE-FREE.
+
+def _import_frame_naming():
+    """frame_extractor.naming.expected_frame_filenames, or None on a bare submit host."""
+    try:
+        from frame_extractor.naming import expected_frame_filenames
+        return expected_frame_filenames
+    except Exception:
+        return None
+
+
+def _import_windowing():
+    """background_generator.windowing, or None on a bare submit host."""
+    try:
+        from background_generator import windowing
+        return windowing
+    except Exception:
+        return None
+
+
+#################################################################
 ##### FRAME EXTRACT (cell-seg heavy preprocessing)
 #################################################################
+def iter_frame_extract_units(video_root_dir, frames_root_dir, datestring, verbose=False):
+    """
+    Yield every (date, cam) frame-extraction work unit that has source videos.
+
+    Yields dicts: {date, cam, cam_dir, out_dir, txts}. A unit with an empty
+    ``txts`` list has no usable source (the engine needs the per-video .txt
+    timestamp sidecars) and is *skipped* by the generator -- neither done nor
+    pending. Callers that report coverage must account for that third state.
+    """
+    import os, glob
+    from pathlib import Path
+
+    days = list(datestring) if isinstance(datestring, (list, tuple)) else [datestring]
+    for date in days:
+        date_dir = os.path.join(video_root_dir, date)
+        if not os.path.isdir(date_dir):
+            if verbose:
+                print(f"[frame_extract] no date dir: {date_dir}")
+            continue
+
+        cam_dirs = sorted(d for d in glob.glob(os.path.join(date_dir, "cam-*")) if os.path.isdir(d))
+        for cam_dir in cam_dirs:
+            cam = os.path.basename(cam_dir)
+            mp4s = sorted(glob.glob(os.path.join(cam_dir, "*.mp4")))
+            txts = [Path(v).with_suffix(".txt") for v in mp4s]
+            txts = [t for t in txts if t.exists()]
+            yield {
+                "date": date,
+                "cam": cam,
+                "cam_dir": cam_dir,
+                "out_dir": os.path.join(frames_root_dir, date, cam),
+                "txts": txts,
+            }
+
+
+def frame_extract_is_done(out_dir, txts, interval_in_sec, fps, file_format, verbose=False):
+    """
+    True when every expected output frame already exists.
+
+    Uses the engine's own ``expected_frame_filenames`` when importable (a coarser
+    interval that is a multiple of a finer completed run yields a subset of the
+    finer run's names, so re-running a finished date schedules nothing). Falls
+    back to a presence check when the cell-seg package is absent.
+    """
+    import os
+
+    expected_frame_filenames = _import_frame_naming()
+    if expected_frame_filenames is not None:
+        try:
+            expected = expected_frame_filenames(txts, interval_in_sec, fps, file_format)
+            if not expected:
+                return False
+            existing = set(os.listdir(out_dir)) if os.path.isdir(out_dir) else set()
+            return expected.issubset(existing)
+        except Exception as e:
+            if verbose:
+                print(f"[frame_extract] skip-check error {out_dir}: {e!r}")
+            return False
+
+    return os.path.isdir(out_dir) and any(
+        fn.endswith(f".{file_format}") for fn in os.listdir(out_dir)
+    )
+
+
 def generate_jobs_frame_extract(
     video_root_dir,        # e.g. settings.videodir_hpc
     frames_root_dir,       # e.g. settings.frames_dir_hpc
@@ -617,80 +726,39 @@ def generate_jobs_frame_extract(
     Yield chunks of (date, camera) frame-extraction work units.
 
     Enumerates ``video_root/<date>/cam-N/`` subtrees (the same layout detect
-    uses) and skips a (date, cam) only when EVERY expected output frame already
-    exists -- a per-filename check via
-    ``frame_extractor.naming.expected_frame_filenames``. Because a coarser
-    interval that is a multiple of a finer one produces a subset of the finer
-    run's filenames, re-running a finished date at a coarser interval schedules
-    nothing. Falls back to a presence check if the cell-seg package is not
-    importable on the submitter.
+    uses) via iter_frame_extract_units, and skips a (date, cam) only when EVERY
+    expected output frame already exists (frame_extract_is_done).
 
     Yields
     ------
     dict: {"work_units": [ {date, cam, video_root, frames_root, interval_in_sec,
                             fps, file_format, decoder, max_workers}, ... ]}
     """
-    import os, glob
-    from pathlib import Path
-
-    try:
-        from frame_extractor.naming import expected_frame_filenames
-    except Exception as e:
-        expected_frame_filenames = None
-        print(f"[frame_extract] frame_extractor not importable ({e!r}); using presence-based skip")
+    if _import_frame_naming() is None:
+        print("[frame_extract] frame_extractor not importable; using presence-based skip")
 
     days = list(datestring) if isinstance(datestring, (list, tuple)) else [datestring]
 
     units = []
-    for date in days:
-        date_dir = os.path.join(video_root_dir, date)
-        if not os.path.isdir(date_dir):
+    for u in iter_frame_extract_units(video_root_dir, frames_root_dir, days, verbose=verbose):
+        if not u["txts"]:
+            continue
+        if frame_extract_is_done(u["out_dir"], u["txts"], interval_in_sec, fps, file_format, verbose):
             if verbose:
-                print(f"[frame_extract] no date dir: {date_dir}")
+                print(f"[frame_extract] done: {u['date']}/{u['cam']}")
             continue
 
-        cam_dirs = sorted(d for d in glob.glob(os.path.join(date_dir, "cam-*")) if os.path.isdir(d))
-        for cam_dir in cam_dirs:
-            cam = os.path.basename(cam_dir)
-            mp4s = sorted(glob.glob(os.path.join(cam_dir, "*.mp4")))
-            txts = [Path(v).with_suffix(".txt") for v in mp4s]
-            txts = [t for t in txts if t.exists()]
-            if not txts:
-                continue
-
-            out_dir = os.path.join(frames_root_dir, date, cam)
-
-            done = False
-            if expected_frame_filenames is not None:
-                try:
-                    expected = expected_frame_filenames(txts, interval_in_sec, fps, file_format)
-                    if expected:
-                        existing = set(os.listdir(out_dir)) if os.path.isdir(out_dir) else set()
-                        done = expected.issubset(existing)
-                except Exception as e:
-                    if verbose:
-                        print(f"[frame_extract] skip-check error {cam_dir}: {e!r}")
-            else:
-                done = os.path.isdir(out_dir) and any(
-                    fn.endswith(f".{file_format}") for fn in os.listdir(out_dir)
-                )
-
-            if done:
-                if verbose:
-                    print(f"[frame_extract] done: {date}/{cam}")
-                continue
-
-            units.append({
-                "date": date,
-                "cam": cam,
-                "video_root": video_root_dir,
-                "frames_root": frames_root_dir,
-                "interval_in_sec": interval_in_sec,
-                "fps": fps,
-                "file_format": file_format,
-                "decoder": decoder,
-                "max_workers": max_workers,
-            })
+        units.append({
+            "date": u["date"],
+            "cam": u["cam"],
+            "video_root": video_root_dir,
+            "frames_root": frames_root_dir,
+            "interval_in_sec": interval_in_sec,
+            "fps": fps,
+            "file_format": file_format,
+            "decoder": decoder,
+            "max_workers": max_workers,
+        })
 
     units.sort(key=lambda u: (u["date"], u["cam"]))
     if maxjobs is not None:
@@ -757,6 +825,158 @@ def _expected_background_names_fallback(frame_names, frame_interval_sec, backgro
     return {"background_" + b.strftime("%Y%m%dT%H%M%S") + ".000000.000Z.png" for b in buckets}
 
 
+def _config_tag_fallback(frame_interval_sec, background_window, window_size, num_median_images):
+    """Dependency-free mirror of ``background_generator.windowing.config_tag``.
+
+    The config tag names the output subdirectory
+    ``<backgrounds_root>/<date>/<cam>/<tag>/``, so getting it wrong makes the
+    skip check stat a directory that never exists and every (date, cam) look
+    pending forever. Must stay in sync with the fork's windowing.py, which is
+    canonical and used whenever importable. test/test_progress.py asserts the two
+    agree when background_generator is installed.
+    """
+    interval = frame_interval_sec or 0
+    if background_window:
+        return f"int{interval}s_win{background_window}"
+    return f"count_w{window_size}_n{num_median_images}_int{interval}s"
+
+
+def background_config_tag(frame_interval_sec, background_window, window_size, num_median_images):
+    """Canonical config tag when background_generator is importable, else the mirror."""
+    w = _import_windowing()
+    if w is not None:
+        return w.config_tag(frame_interval_sec, background_window, window_size, num_median_images)
+    return _config_tag_fallback(frame_interval_sec, background_window, window_size, num_median_images)
+
+
+def list_background_tag_dirs(out_cam_dir):
+    """Config-tag subdirectories that actually exist under <output>/<cam>/."""
+    import os
+    if not os.path.isdir(out_cam_dir):
+        return []
+    return sorted(d for d in os.listdir(out_cam_dir) if os.path.isdir(os.path.join(out_cam_dir, d)))
+
+
+def resolve_background_tag(out_cam_dir, frame_interval_sec, background_window,
+                           window_size, num_median_images):
+    """
+    Return (tag, note) -- the config-tag dir to check for existing backgrounds.
+
+    When background_generator is importable its config_tag is authoritative and we
+    use it. When it is NOT (a bare submit host), our mirror is a guess: if the
+    guessed dir is absent but exactly one tag dir exists on disk, that one was
+    created by the engine for this product, so we use it and return a note. With
+    two or more we cannot disambiguate, so we keep the guess and warn. With none,
+    nothing has been produced yet and the guess is harmless.
+
+    Without this, a wrong guess makes background_submit reschedule finished work
+    on every run.
+    """
+    import os
+
+    w = _import_windowing()
+    if w is not None:
+        return w.config_tag(frame_interval_sec, background_window, window_size, num_median_images), None
+
+    tag = _config_tag_fallback(frame_interval_sec, background_window, window_size, num_median_images)
+    if os.path.isdir(os.path.join(out_cam_dir, tag)):
+        return tag, None
+
+    existing = list_background_tag_dirs(out_cam_dir)
+    if len(existing) == 1:
+        return existing[0], (
+            f"background_generator not importable: guessed config tag {tag!r} is absent under "
+            f"{out_cam_dir}; using the only tag dir present ({existing[0]!r})."
+        )
+    if len(existing) > 1:
+        return tag, (
+            f"background_generator not importable: guessed config tag {tag!r} is absent under "
+            f"{out_cam_dir} and {len(existing)} tag dirs exist ({', '.join(existing)}); cannot "
+            f"disambiguate. Install background_generator on this host to get the canonical tag."
+        )
+    return tag, None
+
+
+def background_expected_names(frame_names, frame_interval_sec, background_window):
+    """Exact per-window background_*.png names the engine will produce."""
+    w = _import_windowing()
+    if w is not None:
+        return w.expected_background_names(frame_names, frame_interval_sec, background_window)
+    return _expected_background_names_fallback(frame_names, frame_interval_sec, background_window)
+
+
+def background_kept_count(frame_names, frame_interval_sec):
+    """Frames surviving interval subsampling -- mirrors what the engine will use."""
+    w = _import_windowing()
+    if frame_interval_sec and w is not None:
+        return len(w.select_by_interval(sorted(frame_names), frame_interval_sec))
+    return len(frame_names)
+
+
+def background_day_of(name):
+    """YYYYMMDD of a frame filename, or None."""
+    import re
+    w = _import_windowing()
+    if w is not None:
+        ts = w.parse_ts_from_name(name)
+        return ts.strftime("%Y%m%d") if ts is not None else None
+    m = re.search(r"(\d{8})T\d{6}", name)
+    return m.group(1) if m else None
+
+
+def background_is_done(out_cam_tag_dir, frame_names, frame_interval_sec, background_window):
+    """
+    Window mode: every expected per-window background_<ts>.png exists.
+    Count/rolling mode (background_window=None): any background_*.png is 'done enough'.
+    """
+    import os
+
+    if background_window:
+        expected = background_expected_names(frame_names, frame_interval_sec, background_window)
+        if not expected:
+            return False
+        existing = set(os.listdir(out_cam_tag_dir)) if os.path.isdir(out_cam_tag_dir) else set()
+        return expected.issubset(existing)
+
+    return os.path.isdir(out_cam_tag_dir) and any(
+        fn.startswith("background_") and fn.endswith(".png") for fn in os.listdir(out_cam_tag_dir)
+    )
+
+
+def iter_background_scopes(frames_root_dir, backgrounds_root_dir, datestring,
+                           source_dir=None, label=None, out_dir=None):
+    """
+    (scan_dir, output_path, scope_id, explicit) per scope.
+
+    Date mode: one scope per date. Explicit-dir mode (source_dir set): a single
+    scope with no date level, output under <out_dir or backgrounds_root>/<label>.
+    """
+    import os
+
+    if source_dir is not None:
+        out_base = out_dir or backgrounds_root_dir
+        lbl = label or os.path.basename(str(source_dir).rstrip("/")) or "frames"
+        return [(str(source_dir), os.path.join(out_base, lbl), lbl, True)]
+
+    days = list(datestring) if isinstance(datestring, (list, tuple)) else [datestring]
+    return [(os.path.join(frames_root_dir, d), os.path.join(backgrounds_root_dir, d), d, False)
+            for d in days]
+
+
+def iter_background_cams(scan_dir, cams=None):
+    """Yield (cam, cam_dir, frame_names) for each cam-N dir under scan_dir."""
+    import os, glob
+
+    if not os.path.isdir(scan_dir):
+        return
+    cam_filter = set(cams) if cams else None
+    for cam_dir in sorted(d for d in glob.glob(os.path.join(scan_dir, "cam-*")) if os.path.isdir(d)):
+        cam = os.path.basename(cam_dir)
+        if cam_filter is not None and cam not in cam_filter:
+            continue
+        yield cam, cam_dir, [fn for fn in os.listdir(cam_dir) if fn.endswith(".png")]
+
+
 def generate_jobs_background(
     frames_root_dir,        # e.g. settings.frames_dir_hpc
     backgrounds_root_dir,   # e.g. settings.backgrounds_dir_hpc
@@ -790,16 +1010,11 @@ def generate_jobs_background(
         date; output under ``backgrounds_root/<date>``.
       - Explicit-dir mode (``source_dir`` set): cameras under ``source_dir/cam-N/``
         directly (no date level -- e.g. bb_monitor's ``single_video_frames/``);
-        output under ``<out_dir or backgrounds_root>/<label>``. The matching
-        ``BackgroundImageGenerator`` auto-discovers the ``cam-N`` subdirs, so this
-        is its natural input.
+        output under ``<out_dir or backgrounds_root>/<label>``.
 
     The output config tag (interval/window settings) is encoded in the output
     path, so a (scope, cam) is skipped when the backgrounds for THIS config
-    already exist:
-      - window mode: every expected per-window ``background_<wstart>.png`` exists
-        (via ``background_generator.windowing.expected_background_names``)
-      - count mode: the config-tag dir already contains >= 1 ``background_*.png``
+    already exist -- see background_is_done / resolve_background_tag.
 
     Yields
     ------
@@ -807,26 +1022,15 @@ def generate_jobs_background(
                             (source_path, output_path in explicit-dir mode)}, ... ]}
 
     Day-sharding (``dates`` + ``source_dir``): emits one work unit per (cam, day)
-    so each task masks/backgrounds only that day -- bounded runtime, parallelizable.
-    Days with fewer than ``min_frames`` frames are skipped (the engine could not
-    produce a background for them, so they must not be scheduled forever).
+    so each task masks/backgrounds only that day. Days with fewer than
+    ``min_frames`` frames are skipped (the engine could not produce a background
+    for them, so they must not be scheduled forever).
     """
-    import os, glob, re
+    import os
 
-    try:
-        from background_generator import windowing
-    except Exception as e:
-        windowing = None
-        print(f"[background] background_generator not importable ({e!r}); using presence-based skip")
+    if _import_windowing() is None:
+        print("[background] background_generator not importable; using mirrored skip logic")
 
-    if windowing is not None:
-        tag = windowing.config_tag(frame_interval_sec, background_window, window_size, num_median_images)
-    else:
-        interval = frame_interval_sec or 0
-        tag = (f"int{interval}s_win{background_window}" if background_window
-               else f"count_w{window_size}_n{num_median_images}_int{interval}s")
-
-    cam_filter = set(cams) if cams else None
     # Day filter is only meaningful in explicit-dir mode (date mode already shards
     # per date via scopes). Dedup so a repeated date does not emit duplicate units.
     dates_filter = list(dict.fromkeys(dates)) if (dates and source_dir is not None) else None
@@ -847,39 +1051,6 @@ def generate_jobs_background(
             "min_frames": min_frames,
         }
 
-    def _day_of(name):
-        if windowing is not None:
-            ts = windowing.parse_ts_from_name(name)
-            return ts.strftime("%Y%m%d") if ts is not None else None
-        m = re.search(r"(\d{8})T\d{6}", name)
-        return m.group(1) if m else None
-
-    def _kept_count(names):
-        # Frames that survive interval subsampling -- mirrors the engine so the
-        # min_frames decision matches what the engine will actually do.
-        if frame_interval_sec and windowing is not None:
-            return len(windowing.select_by_interval(sorted(names), frame_interval_sec))
-        return len(names)
-
-    def _expected(names):
-        # Use the engine's canonical windowing when importable, else the
-        # dependency-free mirror, so the per-day skip is precise on any host.
-        if windowing is not None:
-            return windowing.expected_background_names(names, frame_interval_sec, background_window)
-        return _expected_background_names_fallback(names, frame_interval_sec, background_window)
-
-    def _is_done(out_cam_tag_dir, frame_names):
-        if background_window:
-            expected = _expected(frame_names)
-            if not expected:
-                return False
-            existing = set(os.listdir(out_cam_tag_dir)) if os.path.isdir(out_cam_tag_dir) else set()
-            return expected.issubset(existing)
-        # Count/rolling mode (no window): a present background is "done enough".
-        return os.path.isdir(out_cam_tag_dir) and any(
-            fn.startswith("background_") and fn.endswith(".png") for fn in os.listdir(out_cam_tag_dir)
-        )
-
     def _make_unit(scope_id, cam, scan_dir, output_path, explicit, day=None):
         unit = {
             "date": scope_id,   # YYYYMMDD in date mode, label in explicit-dir mode
@@ -898,60 +1069,53 @@ def generate_jobs_background(
         unit.update(_knobs())
         return unit
 
-    # Each "scope" is (scan_dir, output_path, scope_id, explicit). One per date in
-    # date mode; a single scope (no date level) in explicit-dir mode.
-    if source_dir is not None:
-        out_base = out_dir or backgrounds_root_dir
-        lbl = label or os.path.basename(str(source_dir).rstrip("/")) or "frames"
-        scopes = [(str(source_dir), os.path.join(out_base, lbl), lbl, True)]
-        n_scopes = 1
-    else:
-        days = list(datestring) if isinstance(datestring, (list, tuple)) else [datestring]
-        scopes = [(os.path.join(frames_root_dir, d), os.path.join(backgrounds_root_dir, d), d, False)
-                  for d in days]
-        n_scopes = len(days)
+    scopes = iter_background_scopes(frames_root_dir, backgrounds_root_dir, datestring,
+                                    source_dir=source_dir, label=label, out_dir=out_dir)
+    tag = background_config_tag(frame_interval_sec, background_window, window_size, num_median_images)
 
     units = []
+    seen_notes = set()
     for scan_dir, output_path, scope_id, explicit in scopes:
         if not os.path.isdir(scan_dir):
             if verbose:
                 print(f"[background] no frames dir: {scan_dir}")
             continue
 
-        cam_dirs = sorted(d for d in glob.glob(os.path.join(scan_dir, "cam-*")) if os.path.isdir(d))
-        for cam_dir in cam_dirs:
-            cam = os.path.basename(cam_dir)
-            if cam_filter is not None and cam not in cam_filter:
-                continue
-            frame_names = [fn for fn in os.listdir(cam_dir) if fn.endswith(".png")]
+        for cam, cam_dir, frame_names in iter_background_cams(scan_dir, cams):
             if not frame_names:
                 continue
 
-            out_cam_tag_dir = os.path.join(output_path, cam, tag)
+            out_cam_dir = os.path.join(output_path, cam)
+            cam_tag, note = resolve_background_tag(
+                out_cam_dir, frame_interval_sec, background_window, window_size, num_median_images)
+            if note and note not in seen_notes:
+                seen_notes.add(note)
+                print(f"[background] WARNING: {note}")
+            out_cam_tag_dir = os.path.join(out_cam_dir, cam_tag)
 
             if dates_filter is not None:
                 # One unit per requested day (each task masks/backgrounds that day only).
                 by_day = {}
                 for fn in frame_names:
-                    d = _day_of(fn)
+                    d = background_day_of(fn)
                     if d is not None:
                         by_day.setdefault(d, []).append(fn)
                 for d in dates_filter:
                     day_frames = by_day.get(d, [])
-                    if _kept_count(day_frames) < int(min_frames):
+                    if background_kept_count(day_frames, frame_interval_sec) < int(min_frames):
                         if verbose:
                             print(f"[background] skip {scope_id}/{cam} {d}: "
                                   f"{len(day_frames)} frame(s) < min_frames={min_frames}")
                         continue
-                    if _is_done(out_cam_tag_dir, day_frames):
+                    if background_is_done(out_cam_tag_dir, day_frames, frame_interval_sec, background_window):
                         if verbose:
-                            print(f"[background] done: {scope_id}/{cam} {d} [{tag}]")
+                            print(f"[background] done: {scope_id}/{cam} {d} [{cam_tag}]")
                         continue
                     units.append(_make_unit(scope_id, cam, scan_dir, output_path, explicit, day=d))
             else:
-                if _is_done(out_cam_tag_dir, frame_names):
+                if background_is_done(out_cam_tag_dir, frame_names, frame_interval_sec, background_window):
                     if verbose:
-                        print(f"[background] done: {scope_id}/{cam} [{tag}]")
+                        print(f"[background] done: {scope_id}/{cam} [{cam_tag}]")
                     continue
                 units.append(_make_unit(scope_id, cam, scan_dir, output_path, explicit))
 
@@ -959,7 +1123,7 @@ def generate_jobs_background(
     if maxjobs is not None:
         units = units[: int(chunk_size) * int(maxjobs)]
 
-    print(f"[background] scopes={n_scopes} units={len(units)} chunk_size={chunk_size} "
+    print(f"[background] scopes={len(scopes)} units={len(units)} chunk_size={chunk_size} "
           f"maxjobs={maxjobs} tag={tag}"
           + (f" source_dir={source_dir}" if source_dir else "")
           + (f" dates={dates_filter}" if dates_filter is not None else ""))

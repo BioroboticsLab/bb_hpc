@@ -5,6 +5,7 @@ from datetime import datetime
 
 from bb_hpc import settings
 from bb_hpc.src.generate import generate_jobs_save_detect
+from bb_hpc.src.repo_guard import assert_clean_repo_root
 import re
 
 def parse_args():
@@ -150,6 +151,9 @@ def main():
     # but emit HPC-visible paths into the job files.
     resultdir_local   = Path(settings.resultdir_local)
     pipeline_root_local = Path(settings.pipeline_root_local)
+
+    # A stray dir in the repo root breaks every pod identically; catch it here.
+    assert_clean_repo_root(pipeline_root_local)
 
     # Where to write filelists/spec (host) and where the Pod will read them (HPC path)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")

@@ -8,6 +8,7 @@ from slurmhelper import SLURMJob
 
 from bb_hpc.src.generate import generate_jobs_tracking
 from bb_hpc.src.jobfunctions import job_for_tracking_chunk
+from bb_hpc.src.repo_guard import assert_clean_repo_root
 from bb_hpc.src.slurm_utils import resolve_slurm_config, apply_slurm_to_job, run_jobs_and_log
 
 
@@ -30,7 +31,10 @@ def main():
     s_trk = settings.track_settings
     base_slurm = settings.slurm
     # Merge with "specific overrides general"
-    slurm_cfg = resolve_slurm_config(base_slurm, s_trk)    
+    slurm_cfg = resolve_slurm_config(base_slurm, s_trk)
+
+    # A stray dir in the repo root breaks every task identically; catch it here.
+    assert_clean_repo_root(settings.pipeline_root_hpc)
 
     # Build tracking jobs using the same knobs as your Docker submitter
     batches = list(generate_jobs_tracking(

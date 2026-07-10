@@ -38,7 +38,10 @@ detect_settings = {
     "max_attempts": 3,           # per-video retries before giving up
     "retry_backoff_sec": 5,      # base backoff between attempts (scaled by attempt #)
     "skip_existing": True,       # runtime skip of videos whose primary .bbb is already non-zero
-    "failure_list_dir": None,    # durable failure list dir; None -> <pipeline_root>/_detect_failures
+    "failure_list_dir": None,    # durable failure list dir; None -> a "detect_failures" dir beside
+                                 # pipeline_root. Never point this inside pipeline_root: bb_binary
+                                 # int()-parses every dir name at the repo root, so a non-numeric
+                                 # one breaks all reads (tracking, save_detect).
     # per-job Slurm overrides (optional)
     "slurm": {
         "max_memory": "6GB",

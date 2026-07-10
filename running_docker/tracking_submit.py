@@ -7,6 +7,7 @@ import subprocess
 
 from bb_hpc import settings
 from bb_hpc.src.generate import generate_jobs_tracking
+from bb_hpc.src.repo_guard import assert_clean_repo_root
 
 
 def parse_args():
@@ -132,6 +133,9 @@ def main():
     interval_hours = int(s_track.get("interval_hours", 1))
     temp_dir       = s_track.get("temp_path", "/tmp/bb_tracking_tmp")
     gpu_enabled    = bool(s_track.get("gpu", False))
+
+    # A stray dir in the repo root breaks every container identically; catch it here.
+    assert_clean_repo_root(settings.pipeline_root_local)
 
     # Filelists locations
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")

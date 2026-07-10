@@ -47,10 +47,41 @@ def _latest_div_mtime(day_dir: Path) -> datetime | None:
         except Exception:
             return None
 
+def _max_file_mtime_python(day_dir: Path) -> datetime | None:
+    """
+    Portable fallback for _latest_file_mtime: newest mtime among all files under
+    day_dir, via scandir. Slower than GNU find, but CORRECT everywhere -- notably
+    on BSD/macOS, where `find -printf` does not exist.
+
+    Do NOT fall back to day_dir.stat() instead: a new video lands in
+    <day>/cam-N/, which bumps the *camera* directory's mtime, not the day's, so a
+    day-mtime check would silently trust a stale cache forever.
+    """
+    newest = None
+    stack = [str(day_dir)]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                            continue
+                        mt = entry.stat(follow_symlinks=False).st_mtime
+                    except OSError:
+                        continue
+                    if newest is None or mt > newest:
+                        newest = mt
+        except (FileNotFoundError, PermissionError, NotADirectoryError, OSError):
+            continue
+    return datetime.fromtimestamp(newest, tz=timezone.utc) if newest is not None else None
+
+
 def _latest_file_mtime(day_dir: Path) -> datetime | None:
     """
     Return the newest file mtime anywhere under day_dir (recursive).
-    Used for RPi daily caches where raw videos and detections live together.
+    Used for RPi and raw-video daily caches, where files live in per-camera subdirs.
     """
     import subprocess, shlex
     try:
@@ -65,12 +96,12 @@ def _latest_file_mtime(day_dir: Path) -> datetime | None:
                     newest = dt
             except Exception:
                 continue
-        return newest
+        if newest is not None:
+            return newest
+        # GNU find succeeded but printed nothing usable (e.g. empty dir): fall through.
     except Exception:
-        try:
-            return datetime.fromtimestamp(day_dir.stat().st_mtime, tz=timezone.utc)
-        except Exception:
-            return None
+        pass
+    return _max_file_mtime_python(day_dir)
 
 def _safe_subdirs(p: Path):
     try:
@@ -82,6 +113,19 @@ def _safe_subdirs(p: Path):
                 continue
     except (FileNotFoundError, PermissionError, OSError):
         return
+
+def _is_day_dirname(name: str) -> bool:
+    """True for a top-level day directory: YYYYMMDD or YYYY-MM-DD."""
+    if len(name) == 8 and name.isdigit():
+        return True
+    if len(name) == 10 and name[4] == "-" and name[7] == "-":
+        y, m, d = name.split("-")
+        return y.isdigit() and m.isdigit() and d.isdigit()
+    return False
+
+def _day_key(name: str) -> str:
+    """Normalize a day dir name to YYYYMMDD (sortable, cache-file safe)."""
+    return name.replace("-", "")
 
 def _list_rpi_day(day_dir: Path, day_str: str, video_glob_pattern: str) -> pd.DataFrame:
     """
@@ -223,6 +267,105 @@ def list_rpi_files_incremental(video_root: str, cache_dir: str, video_glob_patte
         return pd.concat(dfs, ignore_index=True)
     return pd.DataFrame(columns=["date", "cam", "video_name", "full_path", "detections_clahe", "detections_noclahe"])
 
+VIDEO_INFO_COLUMNS = ["file_name", "full_path", "starttime", "endtime", "cam"]
+
+def list_video_day(day_dir, exts=(".mp4",)) -> pd.DataFrame:
+    """
+    Catalog every raw video under one day directory (recursive).
+
+    Columns: file_name, full_path, starttime, endtime, cam.
+    Unparsable filenames keep the row with None time/cam fields, matching the
+    historical behavior of get_videoinfo.build_video_info_df.
+    """
+    exts_lower = tuple(e.lower() for e in exts)
+    rows = []
+    for root, _, files in os.walk(str(day_dir)):
+        for fn in files:
+            if not fn.lower().endswith(exts_lower):
+                continue
+            cam = start = end = None
+            try:
+                cam, start, end = parse_video_fname(fn)
+            except Exception:
+                pass
+            rows.append({
+                "file_name": fn,
+                "full_path": os.path.join(root, fn),
+                "starttime": start,
+                "endtime": end,
+                "cam": cam,
+            })
+    return pd.DataFrame(rows, columns=VIDEO_INFO_COLUMNS)
+
+
+def list_video_files_incremental(
+    video_root: str,
+    cache_dir: str,
+    exts=(".mp4",),
+    force_recent_days: int = 2,
+) -> pd.DataFrame:
+    """
+    Cache daily catalogs of raw videos under cache_dir/daily/video_YYYYMMDD.parquet.
+    Only rescan a day if the newest file mtime under that day is newer than the cache.
+
+    Mirrors list_rpi_files_incremental, with two additions:
+
+    - The written daily parquet's mtime is back-dated to the *pre-scan* sample of
+      the day's newest file mtime. Both timestamps then come from the same
+      (shared-storage) clock, and any video that lands *during* our os.walk is
+      guaranteed to be newer than the cache -- so it is picked up on the next run
+      instead of being silently lost. Without this, a file written between the
+      find() sample and the parquet write would be masked forever.
+    - force_recent_days unconditionally rescans the N newest day dirs, which is
+      cheap (one day of one season) and covers filesystems with coarse mtime
+      granularity. Set 0 to rely purely on the mtime comparison.
+    """
+    daily_dir = Path(cache_dir) / "daily"
+    daily_dir.mkdir(parents=True, exist_ok=True)
+
+    day_paths = sorted(
+        (d for d in _safe_subdirs(Path(video_root)) if _is_day_dirname(d.name)),
+        key=lambda d: _day_key(d.name),
+    )
+
+    n_force = max(0, int(force_recent_days))
+    forced = {d.name for d in day_paths[len(day_paths) - n_force:]} if n_force else set()
+
+    dfs = []
+    for d in day_paths:
+        out_pq = daily_dir / f"video_{_day_key(d.name)}.parquet"
+
+        # Sample the day's newest file mtime BEFORE scanning it.
+        deep_mtime = _latest_file_mtime(d)
+
+        if d.name not in forced:
+            try:
+                if out_pq.exists():
+                    pq_mtime = datetime.fromtimestamp(out_pq.stat().st_mtime, tz=timezone.utc)
+                    if deep_mtime is None or pq_mtime >= deep_mtime:
+                        try:
+                            dfs.append(pd.read_parquet(out_pq))
+                            continue
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        print(f"{d.name}\n...reindexing video day")
+        df_day = list_video_day(d, exts)
+        try:
+            df_day.to_parquet(out_pq, index=False)
+            if deep_mtime is not None:
+                ts = deep_mtime.timestamp()
+                os.utime(out_pq, (ts, ts))
+        except Exception:
+            pass
+        dfs.append(df_day)
+
+    if dfs:
+        return pd.concat(dfs, ignore_index=True)
+    return pd.DataFrame(columns=VIDEO_INFO_COLUMNS)
+
 def list_bbb_files(
     pipeline_root: str,
     check_read_bbb: bool = False,
@@ -237,6 +380,13 @@ def list_bbb_files(
     """
     if deep_check_bbb:
         check_read_bbb = True
+
+    # Declare the schema up front: pd.DataFrame([]) has ZERO columns, so an empty
+    # repo would produce a catalog that KeyErrors in every reader.
+    cols = ["file_name", "full_path", "starttime", "endtime", "modified_time", "file_size"]
+    if check_read_bbb:
+        cols = cols + ["is_valid", "valid_check"]
+
     def _from_find(root: str) -> pd.DataFrame:
         # %P  = path relative to the starting point
         # %T@ = mtime as seconds since epoch (float)
@@ -282,7 +432,7 @@ def list_bbb_files(
             except Exception:
                 # Skip any malformed lines/filenames rather than stalling the run
                 continue
-        return pd.DataFrame(rows)    
+        return pd.DataFrame(rows, columns=cols)
 
     def _fallback_scandir(root: str) -> pd.DataFrame:
         # If GNU find isn't available, use scandir (faster than os.walk + os.stat)
@@ -327,7 +477,7 @@ def list_bbb_files(
                                 continue
             except PermissionError:
                 continue
-        return pd.DataFrame(rows)
+        return pd.DataFrame(rows, columns=cols)
 
     # Try fast path (GNU find). If that fails, use Python fallback.
     try:
@@ -335,6 +485,8 @@ def list_bbb_files(
     except Exception:
         return _fallback_scandir(pipeline_root)
 
+
+OUTINFO_COLUMNS = ["cam_id", "from_dt", "to_dt", "modified_time"]
 
 def build_outinfo(output_dir, CACHE_DIR, extension, outname):
     # Helper to read existing outputs
@@ -350,7 +502,10 @@ def build_outinfo(output_dir, CACHE_DIR, extension, outname):
             'to_dt': end,
             'modified_time': mtime
         })
-    df = pd.DataFrame(rows)
+    # Always declare the schema: pd.DataFrame([]) has ZERO columns, and a
+    # column-less parquet makes every reader KeyError. That is the normal state
+    # early in a season, before the first output of this stage exists.
+    df = pd.DataFrame(rows, columns=OUTINFO_COLUMNS)
     outpath = os.path.join(CACHE_DIR, f'{outname}.parquet')
     df.to_parquet(outpath, index=False)
     print(f"Wrote {len(df)} rows to {outpath}")

@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from bb_hpc import settings
 from bb_hpc.src.generate import generate_jobs_save_detect
+from bb_hpc.src.repo_guard import assert_clean_repo_root
 
 def parse_args():
     p = argparse.ArgumentParser(description="Submit save-detect shards to local Docker")
@@ -89,6 +90,10 @@ def main():
     # Build shards from generator
     resultdir_local = str(settings.resultdir_local)
     pipeline_root   = str(settings.pipeline_root_local)
+
+    # A stray dir in the repo root breaks every container identically; catch it here.
+    assert_clean_repo_root(pipeline_root)
+
     batches = list(generate_jobs_save_detect(
         RESULTDIR=resultdir_local,
         PIPELINE_ROOT=pipeline_root,

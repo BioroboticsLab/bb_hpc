@@ -85,6 +85,32 @@ python -m bb_hpc.get_fileinfo --what bbb --no-use-cache --deep-check-bbb
 
 After FileInfo is updated, Save-Detect and Tracking will automatically skip already-processed windows.
 
+### VideoInfo (catalog of raw videos)
+
+`get_fileinfo` catalogs *outputs*. `get_videoinfo` catalogs the *raw videos*, writing
+`<resultdir>/bbb_fileinfo/video_info_all.parquet`. It is what `detect_submit --use-fileinfo`
+reads to decide which videos still need detection, and what the progress report uses as
+the denominator for detect coverage.
+
+```bash
+python -m bb_hpc.get_videoinfo
+```
+
+It is **incremental** by default: per-day catalogs are cached under
+`bbb_fileinfo/daily/video_YYYYMMDD.parquet`, and a day is rescanned only when it contains
+files newer than its cache. During a season this makes a refresh cost seconds instead of a
+full recursive walk of every day.
+
+```
+--use-cache / --no-use-cache   # Incremental (default) vs full rescan of every day
+--force-recent-days N          # Always rescan the N newest days (default: 2)
+--exts .mp4 [...]              # Extensions to catalog (default: .mp4)
+--outfile PATH                 # Override the output parquet path
+```
+
+The two newest days are always rescanned because videos are still landing in them; the
+mtime comparison alone can race with a file written during the scan.
+
 ---
 
 ## 3. Running Processing Stages
@@ -212,7 +238,103 @@ Tune sizing after a first batch:
 
 ---
 
-## 4. Additional Notes
+## 4. Progress reporting
+
+See what has processed, what has not, and get the exact commands to fill the gaps.
+
+```bash
+python -m bb_hpc.progress_report
+```
+
+This reads the fileinfo catalogs, classifies **every work unit of every stage** as
+done / pending / skipped, prints a one-screen report, and saves an atomic snapshot to
+`<resultdir>/bbb_fileinfo/progress/latest/`.
+
+Completion is decided by the same predicates the submitters use (`bb_hpc.src.generate`),
+so a unit reported pending here is exactly a unit `<stage>_submit` would schedule.
+`test/test_progress.py` pins that invariant.
+
+| stage | work unit | statuses |
+|---|---|---|
+| `detect` | one raw video | `done` / `zero_byte_stub` / `missing` |
+| `save_detect` | `(cam_id, hour window)` | `done` / `stale` / `missing` |
+| `tracking` | `(cam_id, hour window)` | `done` / `stale` / `missing` |
+| `frame_extract` | `(date, cam)` | `done` / `pending` / `skipped_no_txt` |
+| `background` | `(date, cam)` | `done` / `pending` / `skipped_no_frames` / `skipped_min_frames` |
+| `rpi` | one RPi video | `done` / `missing` |
+
+`stale` means the output is older than a `.bbb` in its window, so it will be redone.
+*Skipped* units can never be produced (a camera with no frames cannot yield a background),
+so they are excluded from the percentage and reported separately rather than dragging
+coverage down forever.
+
+### Options
+
+```
+--dates YYYYMMDD [...]           # Explicit dates (default: every date in the catalogs)
+--since / --until YYYYMMDD       # Inclusive date range
+--last-days N                    # Only the N most recent dates
+--stages detect tracking ...     # Subset of stages (default: all)
+--backend {k8s, slurm, docker}   # Which running_<backend> module the printed commands target
+--refresh {none, videos, fileinfo, all}   # Rebuild catalogs first (default: none)
+--paths {auto, local, hpc}       # Which settings path set to use
+--markdown                       # Render the report as markdown
+--csv PATH                       # Also write the per-day tables to CSV
+--no-save                        # Print only; write nothing
+--exit-nonzero-if-pending        # Exit 1 when anything is pending (for cron alerting)
+```
+
+**Examples:**
+
+```bash
+# fast: read whatever the fileinfo cron produced
+python -m bb_hpc.progress_report
+
+# refresh the (incremental) video catalog first, look at the last week
+python -m bb_hpc.progress_report --refresh videos --last-days 7
+
+# only the comb stages, targeting the slurm submitters
+python -m bb_hpc.progress_report --stages frame_extract background --backend slurm
+```
+
+The report **prints** resubmit commands and writes them to `commands.sh`. It never submits.
+
+### Artifacts
+
+```
+<resultdir>/bbb_fileinfo/progress/
+├── latest/                    # rewritten in place each run (never a symlink: EIO on CIFS)
+│   ├── summary.json           # one-glance totals per stage
+│   ├── report.md              # the rendered report
+│   ├── commands.sh            # resubmit commands for everything unfinished
+│   ├── <stage>_units.parquet  # one row per work unit, with its status
+│   └── <stage>_by_day.parquet # day, total, done, pending, skipped, pct
+└── history.jsonl              # append-only: one summary row per run -> progress over time
+```
+
+### Notebook
+
+`notebooks/pipeline_progress.ipynb` **loads** the snapshot — it recomputes nothing, so its
+cells can never disagree with each other. Use it to drill into `stage.units`, list pending
+days, and copy resubmit commands.
+
+```python
+from bb_hpc.src.progress import load_latest, load_history
+
+rep = load_latest()
+rep.summary()
+rep.stages["tracking"].pending_units()
+rep.commands()                       # or rep.commands(backend="docker")
+load_history()                       # % complete per stage, over time
+```
+
+A typical during-season cadence is a daily cron running
+`python -m bb_hpc.progress_report --refresh videos`, then opening the notebook when
+something looks wrong.
+
+---
+
+## 5. Additional Notes
 
 **Job directories:** Each submission creates a structured job directory with logs, outputs, and job definitions.
 

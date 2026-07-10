@@ -5,6 +5,7 @@ from datetime import datetime, timezone, timedelta
 
 from bb_hpc import settings
 from bb_hpc.src.generate import generate_jobs_tracking
+from bb_hpc.src.repo_guard import assert_clean_repo_root
 
 
 def parse_args():
@@ -162,6 +163,9 @@ def main():
     pipeline_local  = Path(settings.pipeline_root_local)
     resultdir_hpc   = Path(settings.resultdir_hpc)
     pipeline_hpc    = Path(settings.pipeline_root_hpc)
+
+    # A stray dir in the repo root breaks every pod identically; catch it here.
+    assert_clean_repo_root(pipeline_local)
 
     # Where to write filelists on the submission machine (LOCAL) and
     # where the Pod will read the same directory (HPC path)

@@ -6,8 +6,9 @@ from datetime import datetime, timezone, timedelta
 from bb_hpc import settings
 from slurmhelper import SLURMJob
 from bb_hpc.src.slurm_utils import resolve_slurm_config, apply_slurm_to_job, run_jobs_and_log
-from bb_hpc.src.generate import generate_jobs_save_detect  
+from bb_hpc.src.generate import generate_jobs_save_detect
 from bb_hpc.src.jobfunctions import job_for_save_detect_chunk
+from bb_hpc.src.repo_guard import assert_clean_repo_root
 
 
 def parse_args():
@@ -30,7 +31,10 @@ def main():
     s_sd  = settings.save_detect_settings
     base_slurm  = getattr(settings, "slurm", {})
     # Merge with "specific overrides general"
-    slurm_cfg = resolve_slurm_config(base_slurm, s_sd)       
+    slurm_cfg = resolve_slurm_config(base_slurm, s_sd)
+
+    # A stray dir in the repo root breaks every task identically; catch it here.
+    assert_clean_repo_root(settings.pipeline_root_hpc)
 
     # Build shards (HPC view where we list videos/repo), same style as detect
     chunks = list(generate_jobs_save_detect(
