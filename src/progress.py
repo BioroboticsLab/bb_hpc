@@ -446,24 +446,33 @@ def detect_progress(resultdir: str, dates: Sequence[str]) -> StageProgress:
     if df_vid.empty:
         return StageProgress("detect", pd.DataFrame(columns=["day", "cam", "file_name", "status"]))
 
-    df_bbb = _ensure_columns(df_bbb, ["file_name"])
+    df_bbb = _ensure_columns(df_bbb, ["file_name", "starttime"])
     good = df_bbb
     if "is_valid" in df_bbb.columns:
         good = good[good["is_valid"].fillna(False)]
     elif "file_size" in df_bbb.columns:
         good = good[good["file_size"].fillna(0) > 0]
-    done_names = set(good["file_name"].astype(str))
 
-    all_names = set(df_bbb["file_name"].astype(str))
-    stub_names = all_names - done_names
+    # Join on camera + START second, not on the .bbb filename. bb_binary names
+    # its output from the ACTUAL frame timestamps, so for a gappy recording the
+    # end differs from the source video's -- matching the full start--end stem
+    # reported such a video as missing forever even though it was detected.
+    done_keys = set(G.bbb_start_key_series(good).dropna())
+    stub_keys = set(G.bbb_start_key_series(df_bbb).dropna()) - done_keys
+    vid_keys = G.bbb_start_key_series(df_vid)
 
+    status = pd.Series("missing", index=df_vid.index, dtype=object)
+    status[vid_keys.isin(done_keys)] = "done"
+    status[vid_keys.isin(stub_keys)] = "zero_byte_stub"
+
+    # Display column: report the ACTUAL .bbb name where one matched, falling back
+    # to the predicted name for videos with no output yet.
+    actual_by_key = dict(zip(G.bbb_start_key_series(df_bbb),
+                             df_bbb["file_name"].astype(str)))
     expected = df_vid["file_name"].astype(str).map(
         lambda fn: os.path.basename(get_bbb_file_path(fn))
     )
-
-    status = pd.Series("missing", index=df_vid.index, dtype=object)
-    status[expected.isin(done_names)] = "done"
-    status[expected.isin(stub_names)] = "zero_byte_stub"
+    expected = vid_keys.map(lambda k: actual_by_key.get(k)).fillna(expected)
 
     units = pd.DataFrame({
         "day": df_vid["day"].values,

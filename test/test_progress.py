@@ -372,6 +372,52 @@ def test_nonzero_bbb_is_done(tmp_path):
     assert sp.status_counts() == {"done": 2, "missing": 1}
 
 
+def test_bbb_start_key_ignores_the_end_timestamp():
+    """The invariant the whole gappy-recording fix rests on.
+
+    A video and its .bbb must produce the SAME key even when the .bbb's end
+    differs, because bb_binary names its output from the actual frame timestamps
+    rather than from the video's filename.
+    """
+    st = dt(1, 9, 0)
+    vid = pd.DataFrame([{"file_name": f"cam-0__{st.strftime(_TS)}__{dt(1, 9, 5).strftime(_TS)}.mp4",
+                         "starttime": st}])
+    # same start, end 3 minutes later than the video name implies
+    bbb = pd.DataFrame([bbb_row(0, st, dt(1, 9, 8), dt(1, 12))])
+    assert G.bbb_start_key_series(vid).iloc[0] == G.bbb_start_key_series(bbb).iloc[0]
+
+    # ...but a different camera or a different start second must NOT collide
+    other_cam = pd.DataFrame([bbb_row(1, st, dt(1, 9, 5), dt(1, 12))])
+    other_start = pd.DataFrame([bbb_row(0, dt(1, 9, 1), dt(1, 9, 5), dt(1, 12))])
+    assert G.bbb_start_key_series(vid).iloc[0] != G.bbb_start_key_series(other_cam).iloc[0]
+    assert G.bbb_start_key_series(vid).iloc[0] != G.bbb_start_key_series(other_start).iloc[0]
+
+
+def test_detect_matches_bbb_with_gappy_end_timestamp(tmp_path):
+    """A .bbb whose end differs from the video filename's is still that video's.
+
+    Real case: a gappy recording produced a .bbb ending 58s past what the video
+    name implied. Matching the full start--end stem reported it missing forever.
+    """
+    resultdir = tmp_path / "results"
+    cache = resultdir / "bbb_fileinfo"
+    cache.mkdir(parents=True)
+
+    st, en = dt(1, 9, 0), dt(1, 9, 5)
+    stem = f"cam-0__{st.strftime(_TS)}__{en.strftime(_TS)}"
+    pd.DataFrame([{"file_name": f"{stem}.mp4", "full_path": f"/v/{stem}.mp4",
+                   "starttime": st, "endtime": en, "cam": 0}]) \
+        .to_parquet(cache / "video_info_all.parquet", index=False)
+    # detection succeeded, but the last frame landed 3 minutes past the name's end
+    pd.DataFrame([bbb_row(0, st, dt(1, 9, 8), dt(1, 12), size=4096)]) \
+        .to_parquet(cache / "bbb_info_20260701.parquet", index=False)
+
+    sp = P.detect_progress(str(resultdir), ["20260701"])
+    assert sp.status_counts() == {"done": 1}
+    # and the report shows the ACTUAL .bbb name, not the predicted one
+    assert sp.units["expected_bbb"].iloc[0] == bbb_row(0, st, dt(1, 9, 8), dt(1, 12))["file_name"]
+
+
 def test_detect_command_adds_check_read_bbb_only_when_stubs_exist(tmp_path):
     """Plain --use-fileinfo skips a stub by name, so it would never redo one."""
     sp = P.detect_progress(_seed_detect(tmp_path, stub_size=0), ["20260701"])

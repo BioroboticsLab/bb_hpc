@@ -5,7 +5,8 @@ import fnmatch
 
 from bb_binary.parsing import parse_video_fname
 from bb_binary import Repository
-from bb_hpc.src.fileinfo import get_bbb_file_path, get_pending_videos, is_bbb_file_valid_basicmatch
+from bb_hpc.src.fileinfo import (get_pending_videos, is_bbb_file_valid_basicmatch,
+                                 get_bbb_start_key, get_bbb_bucket_and_prefix)
 
 #################################################################
 ##### DETECT 
@@ -70,7 +71,8 @@ def generate_jobs_detect(
 
     # Expect these helpers to be available in your module:
     # - get_pending_videos(slurmdir) -> set[str]
-    # - get_bbb_file_path(video_basename) -> repo-relative .bbb path
+    # - get_bbb_start_key(basename) -> "<cam>|<start second>" match key
+    # - get_bbb_bucket_and_prefix(basename) -> (bucket dir, .bbb name prefix)
 
     # -------------------------------
     # 1) what's already queued
@@ -83,8 +85,7 @@ def generate_jobs_detect(
     # -------------------------------
     # 2) (optional) load BBB catalog
     # -------------------------------
-    existing_relpaths = None
-    existing_fnames   = None
+    existing_start_keys = None
     if use_fileinfo:
         try:
             if RESULTDIR is None:
@@ -109,34 +110,22 @@ def generate_jobs_detect(
                             df = df[df["is_valid"].fillna(False) == True]
                     # The canonical schema produced by list_bbb_files/build_bbb_info_parquet is:
                     #   file_name, full_path, starttime, endtime, modified_time
-                    # We want repo-relative paths; derive them from full_path if they live under repo_output_path.
+                    # We key on cam id + start second rather than on the filename or
+                    # a derived relpath: bb_binary names its output from the ACTUAL
+                    # frame timestamps, so a gappy recording's .bbb has an end the
+                    # video's name never predicted and an exact-name match would
+                    # re-schedule an already-detected video forever.
                     if catalog_ok:
-                        existing_relpaths = set()
-                        if "full_path" in df.columns:
-                            for fp in df["full_path"].astype(str):
-                                # Only derive a relpath if the file is actually under repo_output_path
-                                # (this avoids ValueError for paths from other repositories).
-                                try:
-                                    relp = os.path.relpath(fp, repo_output_path)
-                                    # relpath() will happily create a path with ".." if fp is outside;
-                                    # ensure it's a subpath by rejecting anything that starts with ".."
-                                    if not relp.startswith(".."):
-                                        existing_relpaths.add(os.path.normpath(relp))
-                                except Exception:
-                                    pass
-                        # Also keep a fallback set of file basenames in case relpath derivation fails
-                        if "file_name" in df.columns:
-                            existing_fnames = set(df["file_name"].astype(str).tolist())
+                        existing_start_keys = set(bbb_start_key_series(df).dropna())
 
                     if verbose:
                         print(f"[fileinfo] loaded {latest} rows={len(df)} "
-                              f"derived_relpaths={len(existing_relpaths)} "
+                              f"start_keys={len(existing_start_keys or ())} "
                               f"(repo_root={repo_output_path})")
         except Exception as e:
             if verbose:
                 print(f"[fileinfo] error loading catalog: {e!r} — falling back to disk checks")
-            existing_relpaths = None
-            existing_fnames   = None  # fallback
+            existing_start_keys = None  # fallback
 
     # -------------------------------
     # 3) gather raw mp4s
@@ -189,22 +178,20 @@ def generate_jobs_detect(
         if v in pending:
             continue
 
-        rel = get_bbb_file_path(os.path.basename(v))  # repo-relative expected .bbb
+        base = os.path.basename(v)
 
         # Prefer fast lookups from catalog if available
-        if (existing_relpaths is not None) or (existing_fnames is not None):
-            already = (existing_relpaths is not None and rel in existing_relpaths) \
-                      or (existing_fnames is not None and os.path.basename(rel) in existing_fnames)
-            if already:
+        if existing_start_keys is not None:
+            if _safe_start_key(base) in existing_start_keys:   # O(1)
                 if verbose:
-                    print("already exists (catalog):", rel)
+                    print("already exists (catalog):", base)
                 continue
         else:
-            # Disk check fallback
-            full_bbb = join(repo_output_path, rel)
-            if is_bbb_file_valid_basicmatch(full_bbb, check_read_file=check_read_bbb):
+            # Disk check fallback: glob the bucket for this cam id + start second
+            bucket, prefix = get_bbb_bucket_and_prefix(base)
+            if _disk_has_primary(join(repo_output_path, bucket), prefix, check_read_bbb):
                 if verbose:
-                    print("already exists (disk):", rel)
+                    print("already exists (disk):", base)
                 continue
 
         if verbose:
@@ -283,6 +270,60 @@ def ensure_cam_id(df, column="file_name"):
         cam.loc[missing] = df.loc[missing, column].map(_parse_cam_id)
     df["cam_id"] = cam
     return df
+
+
+def bbb_start_key_series(df, column="file_name"):
+    """
+    Vectorized "cam id + start second" key for a bbb or video catalog.
+
+    This is the join key for "is this video already detected?". It deliberately
+    excludes the end timestamp: bb_binary names its output from the ACTUAL frame
+    timestamps, so a gappy recording's .bbb carries an end the video's filename
+    never predicted (see src/fileinfo.get_bbb_bucket_and_prefix for the full why).
+
+    One vectorized pass, not one parse per row: both catalogs already carry a
+    parsed `starttime` (fileinfo.list_bbb_files / list_video_day), and
+    ensure_cam_id derives cam_id with a single regex. Keeping this vectorized is
+    what preserves the O(1)-per-video lookup in the submit scanner.
+    """
+    if df is None or len(df) == 0:
+        return pd.Series(dtype=object)
+
+    d = ensure_cam_id(df, column=column)
+    start = pd.to_datetime(d["starttime"], utc=True, errors="coerce") \
+        if "starttime" in d.columns else pd.Series(pd.NaT, index=d.index)
+    cam = pd.to_numeric(d["cam_id"], errors="coerce")
+
+    # Legacy catalogs predate the starttime column. Without this fallback every
+    # key would be NA and every video would look un-detected and re-schedule.
+    if start.isna().all() and column in d.columns:
+        print("[fileinfo] catalog has no usable 'starttime'; deriving start keys "
+              "from filenames (slower, one-time)")
+        return d[column].astype(str).map(
+            lambda fn: _safe_start_key(fn)
+        )
+
+    out = pd.Series(pd.NA, index=d.index, dtype=object)
+    ok = start.notna() & cam.notna()
+    if ok.any():
+        out.loc[ok] = (cam[ok].astype("int64").astype(str) + "|"
+                       + start[ok].dt.strftime("%Y-%m-%dT%H:%M:%S"))
+    return out
+
+
+def _safe_start_key(name):
+    try:
+        return get_bbb_start_key(str(name))
+    except Exception:
+        return pd.NA
+
+
+def _disk_has_primary(bucket_dir, prefix, check_read_bbb=False):
+    """Disk fallback: any valid .bbb in the bucket sharing cam id + start second."""
+    return any(
+        is_bbb_file_valid_basicmatch(c, check_read_file=check_read_bbb)
+        for c in sorted(glob.glob(os.path.join(glob.escape(bucket_dir), prefix + "*.bbb")))
+    )
 
 
 def hour_windows(dates, interval_hours=1):

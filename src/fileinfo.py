@@ -539,6 +539,73 @@ def get_bbb_file_path(video_basename):
     # Combine the base directory with the expected .bbb filename
     return bbb_dir+bbb_file_name
 
+#################################################################
+##### matching a video to its .bbb by camera + start second
+#################################################################
+# WHY the end timestamp cannot be part of the match key:
+# bb_binary names its output from the ACTUAL frame timestamps, not from the
+# source video's filename. Repository.add() passes frameContainer.fromTimestamp /
+# toTimestamp (bb_binary repository.py:77-85), which bb_pipeline fills from the
+# first/last decoded frame (pipeline/io.py:195-200); those timestamps come from
+# the companion .txt sidecar (pipeline/io.py:123), not the video container.
+# For a gappy recording (dropped frames) the content end and the filename end
+# legitimately differ -- observed in production by +58s and +100s -- so the full
+# start--end stem is not a usable identity. The START matched to the microsecond
+# in every observed case.
+#
+# Truncated to whole SECONDS, not microseconds, because dt_to_str
+# (bb_binary parsing.py:21-32) omits the fractional part entirely when
+# microsecond == 0; an exact-microsecond key would fail to match every .bbb that
+# lands on a whole second. Second-truncation also absorbs float round-trip drift.
+#
+# NOTE: src/jobfunctions.py duplicates this logic inline (see _primary_locator
+# there). It cannot import from here -- slurmhelper copies each job function's
+# source verbatim, so job functions must not reference module-level definitions
+# (see the banner in jobfunctions.py and src/repo_guard.py). Keep the two in sync.
+
+def get_bbb_bucket_and_prefix(video_basename, minute_step=20):
+    """
+    Locate the .bbb bb_binary will write for a video, by camera + start second.
+
+    Args:
+        video_basename (str): video file name (e.g. cam-0_...mp4).
+        minute_step (int): bb_binary Repository bucket width in minutes.
+    Returns:
+        tuple[str, str]: (repo-relative bucket dir, .bbb filename prefix).
+                         Glob `<repo>/<bucket>/<prefix>*.bbb` to find it.
+    """
+    import re
+    from bb_binary.parsing import parse_video_fname, get_fname
+    cam_id, start, _end = parse_video_fname(video_basename)
+    minute = int(start.minute // minute_step * minute_step)
+    bucket = (f"{start.year}/{start.month:02d}/{start.day:02d}/"
+              f"{start.hour:02d}/{minute:02d}")
+    # get_fname gives exactly "Cam_{id}_{dt_to_str(start)}" -- strip the optional
+    # ".<microseconds>" and the trailing "Z" to get a second-resolution prefix.
+    # The "_" after the cam id anchors it, so Cam_1_ cannot match Cam_11_.
+    return bucket, re.sub(r"(\.\d+)?Z$", "", get_fname(cam_id, start))
+
+
+def bbb_start_key_from_parts(cam_id, start):
+    """Canonical hashable identity for a video/.bbb pair: cam id + start second."""
+    from datetime import timezone
+    if getattr(start, "tzinfo", None) is not None:
+        start = start.astimezone(timezone.utc)
+    return f"{int(cam_id)}|{start.strftime('%Y-%m-%dT%H:%M:%S')}"
+
+
+def get_bbb_start_key(basename):
+    """
+    Start key for a video basename OR a .bbb basename -- the two must agree.
+
+    This is the join key that replaces `basename(get_bbb_file_path(v))` for
+    "is this video already detected?" checks.
+    """
+    from bb_binary.parsing import parse_video_fname
+    cam_id, start, _end = parse_video_fname(basename)
+    return bbb_start_key_from_parts(cam_id, start)
+
+
 def get_pending_videos(input_dir, log_step=500):
     """
     This was used to check if there are pending videos in the 'jobs' directory already queued up.  

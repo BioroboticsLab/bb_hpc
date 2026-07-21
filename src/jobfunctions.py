@@ -128,34 +128,81 @@ def job_for_process_videos(
 
     # Import inside the function (slurmhelper-safe)
     from pipeline.scripts.bb_pipeline import process_video
-    from bb_binary.parsing import parse_video_fname, get_video_fname
+    from bb_binary.parsing import parse_video_fname, get_fname
 
-    def _expected_primary_abs(video_basename):
+    def _primary_locator(video_basename):
         """
-        Absolute path of the PRIMARY .bbb output bb_binary will write for this
-        video. Mirrors src.fileinfo.get_bbb_file_path and bb_binary
-        Repository._path_for_dt (20-min buckets: floor(minute/20)*20).
+        (bucket_dir_abs, filename_prefix) locating the PRIMARY .bbb for this video.
+        Returns None ONLY when the video filename cannot be parsed.
+
+        Matches on camera id + START second -- never the full start--end stem.
+        bb_binary names its output from the ACTUAL frame timestamps
+        (Repository.add -> frameContainer.fromTimestamp/toTimestamp), which
+        bb_pipeline fills from the .txt sidecar, NOT from the video's filename.
+        For a gappy recording (dropped frames) the two ENDs legitimately differ --
+        observed in production by +58s and +100s -- and predicting the full stem
+        turned those successes into failures that killed the whole indexed job.
+        Whole seconds because dt_to_str omits microseconds entirely when they are
+        zero. Bucket layout mirrors Repository._path_for_dt (floor(minute/20)*20).
+
+        NOTE: duplicated from src.fileinfo.get_bbb_bucket_and_prefix on purpose --
+        this function is copied verbatim by slurmhelper and must not import from
+        fileinfo (see the banner at the top of this file). Keep the two in sync.
         NOTE: the bucket width 20 must track Repository.minute_step.
-        Returns None if the filename cannot be parsed.
         """
         try:
-            cam_id, start, end = parse_video_fname(video_basename)
+            import re
+            cam_id, start, _end = parse_video_fname(video_basename)
             minute = int(start.minute // 20 * 20)
-            rel = (
-                f"{start.year}/{str(start.month).zfill(2)}/{str(start.day).zfill(2)}/"
-                f"{str(start.hour).zfill(2)}/{str(minute).zfill(2)}/"
-                f"{get_video_fname(cam_id, start, end)}.bbb"
+            bucket = os.path.join(
+                repo_output_path,
+                f"{start.year}", f"{start.month:02d}", f"{start.day:02d}",
+                f"{start.hour:02d}", f"{minute:02d}",
             )
-            return os.path.join(repo_output_path, rel)
+            # get_fname gives "Cam_{id}_{dt_to_str(start)}"; drop ".<us>" and "Z".
+            # The "_" after the cam id anchors it, so Cam_1_ can't match Cam_11_.
+            return bucket, re.sub(r"(\.\d+)?Z$", "", get_fname(cam_id, start))
         except Exception:
             return None
 
-    def _primary_ok(path):
-        """True iff the primary .bbb exists and is non-zero."""
+    def _primary_candidates(locator):
+        """Every .bbb in the primary bucket sharing this cam id + start second."""
+        if locator is None:
+            return []
+        import glob as _glob
+        bucket, prefix = locator
         try:
-            return path is not None and os.path.getsize(path) > 0
-        except OSError:
-            return False
+            return sorted(_glob.glob(os.path.join(_glob.escape(bucket), prefix + "*.bbb")))
+        except Exception:
+            return []
+
+    def _find_primary(locator):
+        """Path of a written (non-zero) primary .bbb for this video, else None."""
+        hits = []
+        for cand in _primary_candidates(locator):
+            try:
+                if os.path.getsize(cand) > 0:
+                    hits.append(cand)
+            except OSError:
+                pass
+        if len(hits) > 1:
+            print(f"[warn] {len(hits)} non-empty .bbb share this cam+start second; using "
+                  f"{os.path.basename(hits[0])}: {[os.path.basename(h) for h in hits]}")
+        return hits[0] if hits else None
+
+    def _clear_zero_byte_primaries(locator):
+        """
+        Drop 0-byte stubs from a prior failed attempt so bb_binary writes clean.
+        The stub is named from the CONTENT timestamps too, so this must clear any
+        0-byte match -- an exact-name unlink could leave a mis-named stub forever.
+        Only ever deletes size==0, and only in the PRIMARY bucket.
+        """
+        for cand in _primary_candidates(locator):
+            try:
+                if os.path.getsize(cand) == 0:
+                    os.unlink(cand)
+            except OSError:
+                pass
 
     _safe_makedirs(Path(local_cache_dir))
 
@@ -215,13 +262,15 @@ def job_for_process_videos(
     try:
         for vp in video_paths:
             src = Path(vp)
-            expected_abs = _expected_primary_abs(src.name)
+            locator = _primary_locator(src.name)
 
             # Runtime idempotency: skip videos whose primary already exists & is
             # non-zero, so a whole-pod retry redoes only the missing/0-byte ones.
-            if skip_existing and _primary_ok(expected_abs):
-                print(f"[skip] already done: {src.name}")
-                continue
+            if skip_existing:
+                found = _find_primary(locator)
+                if found is not None:
+                    print(f"[skip] already done: {src.name} -> {os.path.basename(found)}")
+                    continue
 
             vid_for_proc = src
             staged_txt = None
@@ -234,26 +283,28 @@ def job_for_process_videos(
                 for attempt in range(1, int(max_attempts) + 1):
                     _deferred_links.clear()
                     # Clear a partial/0-byte stub from a prior failed attempt so
-                    # bb_binary writes a clean file. Only ever delete size==0, and
-                    # only the PRIMARY bucket.
-                    if expected_abs is not None and os.path.exists(expected_abs):
-                        try:
-                            if os.path.getsize(expected_abs) == 0:
-                                os.unlink(expected_abs)
-                        except OSError:
-                            pass
+                    # bb_binary writes a clean file.
+                    _clear_zero_byte_primaries(locator)
 
                     try:
                         process_video(args)
-                        # Success requires a real (non-zero) primary on disk; fall
-                        # back to "no exception" only when the path is unknowable.
-                        if expected_abs is None or _primary_ok(expected_abs):
-                            if expected_abs is None:
-                                print(f"[WARN] {src.name}: could not compute expected .bbb path; "
-                                      f"counting as done without verifying output")
+                        # Success requires a real (non-zero) primary on disk. Search
+                        # FIRST, so the "unknowable" branch below can only ever mean
+                        # "the video filename is unparsable" -- never "we looked and
+                        # found nothing".
+                        found = _find_primary(locator)
+                        if found is not None:
+                            print(f"[ok] {src.name} -> {os.path.basename(found)}")
                             _materialize_deferred_links()
                             break
-                        raise OSError(f"primary .bbb missing/empty after process_video: {expected_abs}")
+                        if locator is None:
+                            print(f"[WARN] {src.name}: could not parse video filename, so the "
+                                  f"expected .bbb is unknowable; counting as done without verifying")
+                            _materialize_deferred_links()
+                            break
+                        _bucket, _prefix = locator
+                        raise OSError(f"no non-empty .bbb matching {_prefix}*.bbb in {_bucket} "
+                                      f"after process_video")
                     except Exception as e:
                         if attempt < int(max_attempts):
                             print(f"[retry] {src.name} attempt {attempt}/{int(max_attempts)} failed ({e}); retrying")

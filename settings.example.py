@@ -178,7 +178,14 @@ k8s = {
 
     "job": {
         "parallelism": 4,
-        "backoff_limit": 1,
+        # NOTE: in an Indexed Job this is a JOB-WIDE retry budget shared by every
+        # index, not a per-index one (the per-index field is backoffLimitPerIndex,
+        # which we do not set). At 1, a single pod failure anywhere kills the whole
+        # job -- a 141-index detect run once died at 1/141 completions because two
+        # videos in one shard failed. Keep enough headroom that a handful of bad
+        # files cannot abort a large run.
+        # Shared by all six k8s submit scripts via settings.k8s["job"].
+        "backoff_limit": 20,
     },
 
     "resources": {

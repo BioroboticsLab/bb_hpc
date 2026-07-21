@@ -28,30 +28,69 @@ import errno
 import tempfile
 import shutil
 import importlib.util
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # --------------------------------------------------------------------------- #
 # Install fake bb_binary / pipeline BEFORE importing any bb_hpc module.
 # --------------------------------------------------------------------------- #
-_TS = "%Y%m%dT%H%M%S"
+_TS = "%Y%m%dT%H%M%S"        # video-side timestamp:  20260622T221901
+_BTS = "%Y-%m-%dT%H_%M_%S"   # bb_binary-side stamp:  2026-06-22T22_19_01
+
+
+def _strptime(s, fmt):
+    """strptime that tolerates an optional .<microseconds> tail."""
+    return datetime.strptime(s, fmt + ".%f" if "." in s else fmt)
 
 
 def _parse_video_fname(basename, format=None):
-    """Fake of bb_binary.parsing.parse_video_fname for our test naming:
-    cam-<id>__<startTS>__<endTS>.<ext>  ->  (cam_id:int, start:dt, end:dt)."""
+    """Fake of bb_binary.parsing.parse_video_fname.
+
+    Handles both shapes the real one does:
+      video: cam-<id>__<startTS>__<endTS>.mp4          (this test's convention)
+      bbb:   Cam_<id>_<start>--<end>.bbb               (real bb_binary shape)
+    """
     stem = basename
     for ext in (".mp4", ".bbb", ".avi"):
         if stem.endswith(ext):
             stem = stem[: -len(ext)]
+    if "--" in stem:  # bb_binary output name
+        head, e = stem.split("--", 1)
+        _cam_label, cam_s, s = head.split("_", 2)
+        return (int(cam_s),
+                _strptime(s.rstrip("Z"), _BTS),
+                _strptime(e.rstrip("Z"), _BTS))
     cam_s, s, e = stem.split("__")
     cam = int(cam_s.replace("cam-", "").replace("Cam_", ""))
-    return cam, datetime.strptime(s, _TS), datetime.strptime(e, _TS)
+    return cam, _strptime(s, _TS), _strptime(e, _TS)
+
+
+def _dt_to_str(dt):
+    """Fake of bb_binary.parsing.dt_to_str: microseconds ONLY when non-zero.
+
+    That omission is load-bearing -- it is why the runner's search prefix is
+    truncated to whole seconds rather than matching exact microseconds.
+    """
+    s = dt.strftime(_BTS)
+    if dt.microsecond:
+        s += f".{dt.microsecond:06d}"
+    return s + "Z"
+
+
+def _get_fname(cam, start):
+    """Fake of bb_binary.parsing.get_fname -> "Cam_{id}_{dt_to_str(start)}"."""
+    return f"Cam_{cam}_{_dt_to_str(start)}"
 
 
 def _get_video_fname(cam, start, end):
-    """Fake of bb_binary.parsing.get_video_fname (deterministic stem)."""
-    return f"Cam_{cam}__{start.strftime(_TS)}__{end.strftime(_TS)}"
+    """Fake of bb_binary.parsing.get_video_fname -- REAL bb_binary shape.
+
+    The '--' separator and the optional '.<us>' tail are load-bearing: the runner
+    derives its search prefix from get_fname(cam, start) and globs '<prefix>*.bbb'.
+    The old 'Cam_{cam}__{ts}__{ts}' stem made the gappy-end bug untestable by
+    construction, because no part of the name distinguished start from end.
+    """
+    return f"{_get_fname(cam, start)}--{_dt_to_str(end)}"
 
 
 def _install_fakes():
@@ -59,6 +98,7 @@ def _install_fakes():
     parsing = types.ModuleType("bb_binary.parsing")
     parsing.parse_video_fname = _parse_video_fname
     parsing.get_video_fname = _get_video_fname
+    parsing.get_fname = _get_fname
     common = types.ModuleType("bb_binary.common")
     common.bbb = object()  # fileinfo does `bbb = bb_binary.common.bbb`
     repository = types.ModuleType("bb_binary.repository")
@@ -84,18 +124,31 @@ def _install_fakes():
 
 # --- fault-injectable fake process_video --------------------------------- #
 # state: how many times called, and which call numbers must fail with EIO.
-_STATE = {"calls": 0, "fail_set": set(), "fail_all": False}
+_STATE = {"calls": 0, "fail_set": set(), "fail_all": False, "end_shift_sec": 0}
 
 
-def _expected_primary(repo_root, video_basename):
+def _primary_path(repo_root, video_basename, end_override=None):
+    """Path of the primary .bbb.
+
+    The BUCKET always comes from the start timestamp (as in bb_binary's
+    _path_for_dt), but the NAME comes from the content timestamps -- which is
+    exactly why `end_override` exists: a gappy recording's last frame lands past
+    the end the video's filename advertises.
+    """
     cam, start, end = _parse_video_fname(video_basename)
     minute = int(start.minute // 20 * 20)
     rel = (
         f"{start.year}/{str(start.month).zfill(2)}/{str(start.day).zfill(2)}/"
         f"{str(start.hour).zfill(2)}/{str(minute).zfill(2)}/"
-        f"{_get_video_fname(cam, start, end)}.bbb"
+        f"{_get_video_fname(cam, start, end_override or end)}.bbb"
     )
     return os.path.join(repo_root, rel)
+
+
+def _content_end(video_basename):
+    """The end timestamp bb_binary would actually record, given end_shift_sec."""
+    _cam, _start, end = _parse_video_fname(video_basename)
+    return end + timedelta(seconds=_STATE["end_shift_sec"])
 
 
 def _process_video(args):
@@ -103,7 +156,8 @@ def _process_video(args):
     writing content; otherwise write non-zero content (truncating)."""
     _STATE["calls"] += 1
     n = _STATE["calls"]
-    primary = _expected_primary(args.repo_output_path, os.path.basename(args.video_path))
+    name = os.path.basename(args.video_path)
+    primary = _primary_path(args.repo_output_path, name, end_override=_content_end(name))
     os.makedirs(os.path.dirname(primary), exist_ok=True)
     open(primary, "w").close()  # 0-byte stub, like bb_binary's add()
     if _STATE["fail_all"] or n in _STATE["fail_set"]:
@@ -168,10 +222,11 @@ else:
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
-def _reset(fail_set=None, fail_all=False):
+def _reset(fail_set=None, fail_all=False, end_shift_sec=0):
     _STATE["calls"] = 0
     _STATE["fail_set"] = set(fail_set or ())
     _STATE["fail_all"] = fail_all
+    _STATE["end_shift_sec"] = end_shift_sec
 
 
 def _video_name(cam=1, start="20260622T221901", end="20260622T222001"):
@@ -224,7 +279,7 @@ def test_transient_failure_is_retried_and_succeeds():
         _reset(fail_set={1})  # first attempt EIO, second OK
         name = _video_name()
         res = _run(repo, [str(Path(repo) / name)])
-        primary = _expected_primary(repo, name)
+        primary = _primary_path(repo, name)
         assert res is True
         assert _STATE["calls"] == 2, "should have retried exactly once"
         assert os.path.getsize(primary) > 0, "primary must be non-zero after retry"
@@ -251,7 +306,7 @@ def test_persistent_failure_exits_nonzero_and_records():
         assert raised.code == 1
         assert _STATE["calls"] == 3, "should have tried max_attempts times"
         # primary left absent or 0-byte (never a bogus non-zero file)
-        primary = _expected_primary(repo, name)
+        primary = _primary_path(repo, name)
         assert (not os.path.exists(primary)) or os.path.getsize(primary) == 0
         # durable failure list written with the source path, beside the repo root
         fdir = _failure_dir(repo)
@@ -323,7 +378,7 @@ def test_skip_existing_skips_nonzero_primary():
     try:
         _reset()
         name = _video_name()
-        primary = _expected_primary(repo, name)
+        primary = _primary_path(repo, name)
         os.makedirs(os.path.dirname(primary), exist_ok=True)
         with open(primary, "w") as f:
             f.write("ALREADY")
@@ -340,7 +395,7 @@ def test_zero_byte_primary_is_not_skipped():
     try:
         _reset()  # processing succeeds this time
         name = _video_name()
-        primary = _expected_primary(repo, name)
+        primary = _primary_path(repo, name)
         os.makedirs(os.path.dirname(primary), exist_ok=True)
         open(primary, "w").close()  # pre-existing 0-byte orphan
         res = _run(repo, [str(Path(repo) / name)], skip_existing=True)
@@ -348,6 +403,106 @@ def test_zero_byte_primary_is_not_skipped():
         assert _STATE["calls"] == 1, "0-byte primary must NOT be skipped"
         assert os.path.getsize(primary) > 0
         print("ok: 0-byte primary is reprocessed, not skipped")
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def test_gappy_end_timestamp_still_counts_as_done():
+    """The outage of 2026-07-21: a valid .bbb whose END differs from the video's.
+
+    bb_binary names its output from the ACTUAL frame timestamps, not the video's
+    filename. Real case: cam-1_...T081529.782248...--...T081812.855549....mp4
+    produced Cam_1_2026-07-16T08_15_29.782248Z--2026-07-16T08_19_11.135227Z.bbb --
+    a valid 11.9 MB file whose end is 58s past what the filename implied, because
+    the recording dropped frames. Predicting the full start--end stem called that
+    success a failure, burned all 3 retries, exited the pod 1, and with
+    backoffLimit: 1 marked the entire 141-index Indexed Job Failed.
+    """
+    parent, repo = _mkrepo()
+    try:
+        _reset(end_shift_sec=59)
+        name = _video_name(cam=1, start="20260716T081529.782248",
+                                  end="20260716T081812.855549")
+        res = _run(repo, [str(Path(repo) / name)])
+        written = _primary_path(repo, name, end_override=_content_end(name))
+        assert res is True
+        assert _STATE["calls"] == 1, "a valid .bbb with a gappy end must not be retried"
+        assert os.path.getsize(written) > 0
+        assert written != _primary_path(repo, name), \
+            "the test is only meaningful if the written name differs from the predicted one"
+        assert not _failure_dir(repo).exists(), "a written .bbb is not a failure"
+        _assert_repo_root_clean(repo)
+        print("ok: gappy end timestamp still counts as done")
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def test_gappy_end_is_skipped_on_rerun():
+    """skip_existing must find the gappy-named .bbb too.
+
+    Otherwise every rerun redoes the video and the submit-time scanner
+    re-schedules it forever -- the slow-burn half of the same bug.
+    """
+    parent, repo = _mkrepo()
+    try:
+        _reset(end_shift_sec=59)
+        name = _video_name(cam=1, start="20260716T081529.782248",
+                                  end="20260716T081812.855549")
+        assert _run(repo, [str(Path(repo) / name)]) is True
+        assert _STATE["calls"] == 1
+
+        _reset(end_shift_sec=59)  # second submit, same video, output already there
+        assert _run(repo, [str(Path(repo) / name)], skip_existing=True) is True
+        assert _STATE["calls"] == 0, "a gappy-named .bbb must be recognized as already done"
+        print("ok: gappy-named .bbb is skipped on rerun")
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def test_zero_byte_gappy_stub_is_cleared_before_retry():
+    """The 0-byte stub is named from the CONTENT timestamps too.
+
+    So the clean-slate step must clear any 0-byte match in the bucket -- the old
+    exact-name unlink could only ever find the predicted name, leaking mis-named
+    stubs on disk forever.
+    """
+    parent, repo = _mkrepo()
+    try:
+        _reset(end_shift_sec=59)
+        name = _video_name(cam=1, start="20260716T081529.782248",
+                                  end="20260716T081812.855549")
+        stub = _primary_path(repo, name, end_override=_content_end(name))
+        os.makedirs(os.path.dirname(stub), exist_ok=True)
+        open(stub, "w").close()  # 0-byte orphan at the gappy name
+
+        res = _run(repo, [str(Path(repo) / name)], skip_existing=True)
+        assert res is True
+        assert _STATE["calls"] == 1, "a 0-byte gappy stub must NOT be treated as done"
+        assert os.path.getsize(stub) > 0, "stub should have been cleared and rewritten"
+        print("ok: 0-byte gappy stub is cleared, not skipped")
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def test_start_prefix_does_not_match_a_different_camera():
+    """Cam_1_<t> must not match Cam_11_<t>: the '_' after the cam id anchors it."""
+    parent, repo = _mkrepo()
+    try:
+        _reset()
+        name = _video_name(cam=1, start="20260716T081529.782248",
+                                  end="20260716T081812.855549")
+        # a decoy from camera 11, same bucket, same start second
+        decoy_src = _video_name(cam=11, start="20260716T081529.782248",
+                                        end="20260716T081812.855549")
+        decoy = _primary_path(repo, decoy_src)
+        os.makedirs(os.path.dirname(decoy), exist_ok=True)
+        with open(decoy, "w") as f:
+            f.write("SOMEONE ELSE'S DETECTIONS")
+
+        res = _run(repo, [str(Path(repo) / name)], skip_existing=True)
+        assert res is True
+        assert _STATE["calls"] == 1, "cam 11's output must not satisfy cam 1's check"
+        print("ok: start prefix does not match a different camera")
     finally:
         shutil.rmtree(parent, ignore_errors=True)
 
@@ -504,6 +659,10 @@ _TESTS = [
     test_explicit_failure_list_dir_is_honored,
     test_skip_existing_skips_nonzero_primary,
     test_zero_byte_primary_is_not_skipped,
+    test_gappy_end_timestamp_still_counts_as_done,
+    test_gappy_end_is_skipped_on_rerun,
+    test_zero_byte_gappy_stub_is_cleared_before_retry,
+    test_start_prefix_does_not_match_a_different_camera,
     test_is_bbb_basicmatch_rejects_zero_byte,
     test_fillin_source_guard_rejects_zero_byte,
     test_boundary_symlink_eio_writes_primary_and_copies,
