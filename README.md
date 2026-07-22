@@ -278,10 +278,18 @@ coverage down forever.
 --backend {k8s, slurm, docker}   # Which running_<backend> module the printed commands target
 --refresh {none, videos, fileinfo, all}   # Rebuild catalogs first (default: none)
 --paths {auto, local, hpc}       # Which settings path set to use
+--interval-hours N               # Window size for save_detect/tracking units (default: 1;
+                                 #   must match what the submitters use)
+--rpi-clahe / --no-rpi-clahe     # Measure RPi done-ness against CLAHE detections
+                                 #   (default: settings.rpi_detect_settings["use_clahe"])
 --markdown                       # Render the report as markdown
 --csv PATH                       # Also write the per-day tables to CSV
+--out-dir PATH                   # Snapshot directory (default: <resultdir>/bbb_fileinfo/progress/)
+--max-days N                     # Per stage, how many pending days to list before
+                                 #   truncating (default: 14)
 --no-save                        # Print only; write nothing
---exit-nonzero-if-pending        # Exit 1 when anything is pending (for cron alerting)
+--exit-nonzero-if-pending        # Exit 1 when anything is pending (for cron alerting).
+                                 #   Off by default: mid-season, pending work is normal
 ```
 
 **Examples:**
@@ -304,6 +312,7 @@ The report **prints** resubmit commands and writes them to `commands.sh`. It nev
 ```
 <resultdir>/bbb_fileinfo/progress/
 ├── latest/                    # rewritten in place each run (never a symlink: EIO on CIFS)
+│   ├── meta.json              # generated_at, dates, resolved paths -- what load_latest() reads
 │   ├── summary.json           # one-glance totals per stage
 │   ├── report.md              # the rendered report
 │   ├── commands.sh            # resubmit commands for everything unfinished
@@ -311,6 +320,9 @@ The report **prints** resubmit commands and writes them to `commands.sh`. It nev
 │   └── <stage>_by_day.parquet # day, total, done, pending, skipped, pct
 └── history.jsonl              # append-only: one summary row per run -> progress over time
 ```
+
+One invocation writes one snapshot with a single `generated_at`, so the numbers in it are
+always mutually consistent. Override the location with `--out-dir`.
 
 ### Notebook
 

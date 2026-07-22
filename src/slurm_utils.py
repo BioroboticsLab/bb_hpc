@@ -116,18 +116,47 @@ def _append_submitted_jobs(jobdir, record):
         print(f"[warn] could not write submitted_jobs.jsonl: {e}")
 
 
+def _queued_job_ids(user, jobname):
+    """Set of this user's currently-queued job IDs for ``jobname`` ('' on any error).
+
+    Note ``%A`` yields one ID per *array element*, so a single 426-task array comes
+    back as 426 IDs -- which is why the fallback must diff, never report the raw set.
+    """
+    try:
+        out = subprocess.run(
+            ["squeue", "-h", "-u", user, "-n", jobname, "-o", "%A"],
+            capture_output=True, text=True, check=False).stdout
+        return set(out.split())
+    except Exception:
+        return set()
+
+
+def _format_job_ids(job_ids, max_shown=12):
+    """Render IDs for the console, eliding the middle of a long list."""
+    if len(job_ids) <= max_shown:
+        return ", ".join(job_ids)
+    head = ", ".join(job_ids[: max_shown // 2])
+    tail = ", ".join(job_ids[-(max_shown // 2):])
+    return f"{head}, ... ({len(job_ids) - max_shown} more) ..., {tail}"
+
+
 def run_jobs_and_log(job, jobdir, jobname, dates, user=None):
     """
     Run ``job.run_jobs()`` while recording the submitted array job IDs.
 
     Captures stdout to scrape sbatch's ``Submitted batch job <id>`` lines (re-printing
     everything so console output is unchanged). If nothing is captured -- e.g. slurmhelper
-    writes directly to the OS fd -- falls back to ``squeue`` for this user+jobname. The
-    IDs (plus timestamp/jobname/dates) are appended to ``<jobdir>/submitted_jobs.jsonl``.
-    Wrapped in try/except throughout so logging never blocks a submission.
+    writes directly to the OS fd -- falls back to the *difference* between ``squeue``
+    snapshots taken before and after the submit, so prior same-name arrays that are still
+    queued are not misattributed to this submission. The IDs (plus timestamp/jobname/dates)
+    are appended to ``<jobdir>/submitted_jobs.jsonl``. Wrapped in try/except throughout so
+    logging never blocks a submission.
 
     Returns the list of job IDs found (possibly empty).
     """
+    user = user or os.environ.get("USER", "")
+    before = _queued_job_ids(user, jobname)
+
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
@@ -140,16 +169,17 @@ def run_jobs_and_log(job, jobdir, jobname, dates, user=None):
     job_ids = re.findall(r"Submitted batch job (\d+)", captured)
     source = "sbatch"
     if not job_ids:
-        # Fallback (note: may also include this user's *prior* same-name arrays still queued)
+        # Only IDs that appeared while we were submitting belong to this run. Tasks that
+        # start and finish inside the submit window are missed; that is preferable to
+        # reporting every queued element of an unrelated array.
+        new_ids = _queued_job_ids(user, jobname) - before
+        # squeue normally yields bare integers; sort numerically but never let an
+        # unexpected format (e.g. '123_4') turn logging into a submit failure.
         try:
-            user = user or os.environ.get("USER", "")
-            out = subprocess.run(
-                ["squeue", "-h", "-u", user, "-n", jobname, "-o", "%A"],
-                capture_output=True, text=True, check=False).stdout
-            job_ids = sorted(set(out.split()))
-            source = "squeue(fallback)"
-        except Exception:
-            job_ids = []
+            job_ids = sorted(new_ids, key=int)
+        except ValueError:
+            job_ids = sorted(new_ids)
+        source = "squeue(fallback,diff)"
 
     try:
         _append_submitted_jobs(jobdir, {
@@ -160,8 +190,11 @@ def run_jobs_and_log(job, jobdir, jobname, dates, user=None):
             "source": source,
         })
         if job_ids:
-            print(f"[submitted] {jobname}: {', '.join(job_ids)} "
-                  f"({source}) -> logged to {os.path.join(jobdir, 'submitted_jobs.jsonl')}")
+            print(f"[submitted] {jobname}: {_format_job_ids(job_ids)} "
+                  f"({source}, {len(job_ids)} id(s)) "
+                  f"-> logged to {os.path.join(jobdir, 'submitted_jobs.jsonl')}")
+        else:
+            print(f"[submitted] {jobname}: no new job IDs detected ({source})")
     except Exception as e:
         print(f"[warn] submission logging failed: {e}")
     return job_ids

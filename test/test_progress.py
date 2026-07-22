@@ -17,6 +17,7 @@ Also covers the specific defects the old bbb_and_tracking_progress.ipynb had:
 Run:  pytest test/test_progress.py
       python test/test_progress.py
 """
+import importlib.machinery
 import os
 import sys
 import types
@@ -44,32 +45,92 @@ def _parse_video_fname(basename, format=None):
             datetime.strptime(e, _TS).replace(tzinfo=UTC))
 
 
+def _dt_to_str(dt_):
+    s = dt_.strftime("%Y-%m-%dT%H_%M_%S")
+    if dt_.microsecond:
+        s += f".{dt_.microsecond:06d}"
+    return s + "Z"
+
+
+def _get_fname(cam, start):
+    return f"Cam_{cam}_{_dt_to_str(start)}"
+
+
 def _get_video_fname(cam, start, end):
     return f"Cam_{cam}__{start.strftime(_TS)}__{end.strftime(_TS)}"
 
 
 def _install_fakes():
-    bb = types.ModuleType("bb_binary")
-    parsing = types.ModuleType("bb_binary.parsing")
-    parsing.parse_video_fname = _parse_video_fname
-    parsing.get_video_fname = _get_video_fname
-    common = types.ModuleType("bb_binary.common")
-    common.bbb = object()
-    repository = types.ModuleType("bb_binary.repository")
-    repository.Repository = type("Repository", (), {})
+    """
+    Install a fake bb_binary WITHOUT clobbering one another test module already put
+    in sys.modules.
+
+    test_detect_robustness.py installs a richer fake (get_fname, dt_to_str, and a
+    real-bb_binary-shaped get_video_fname). Both modules are imported during
+    collection, so whichever loads second must only fill in what is MISSING --
+    replacing the module outright deletes the other's helpers and its tests then
+    fail at call time with a bare ImportError.
+
+    Consequence: this file must never assume which fake won. Use the installed
+    parsing functions (see _gvf below), not the module-level ones here.
+    """
+    defaults = {
+        "parse_video_fname": _parse_video_fname,
+        "get_video_fname": _get_video_fname,
+        "get_fname": _get_fname,
+        "dt_to_str": _dt_to_str,
+    }
+
+    def _module(name):
+        """Get-or-create a fake module that is well-formed enough for importlib.
+
+        A bare types.ModuleType has __spec__ = None, which makes
+        importlib.util.find_spec(name) raise ValueError -- and
+        test_detect_robustness.py calls exactly that to decide whether the REAL
+        deps are installed. Give every fake a real ModuleSpec.
+        """
+        mod = sys.modules.get(name)
+        if mod is None:
+            mod = types.ModuleType(name)
+            mod.__spec__ = importlib.machinery.ModuleSpec(name, loader=None)
+            sys.modules[name] = mod
+        return mod
+
+    parsing = _module("bb_binary.parsing")
+    for name, fn in defaults.items():
+        if not hasattr(parsing, name):
+            setattr(parsing, name, fn)
+
+    common = _module("bb_binary.common")
+    if not hasattr(common, "bbb"):
+        common.bbb = object()
+
+    repository = _module("bb_binary.repository")
+    if not hasattr(repository, "Repository"):
+        repository.Repository = type("Repository", (), {})
+
+    bb = _module("bb_binary")
     bb.parsing = parsing
     bb.common = common
     bb.repository = repository
-    bb.parse_video_fname = _parse_video_fname
-    bb.get_video_fname = _get_video_fname
-    bb.Repository = repository.Repository
-    sys.modules["bb_binary"] = bb
-    sys.modules["bb_binary.parsing"] = parsing
-    sys.modules["bb_binary.common"] = common
-    sys.modules["bb_binary.repository"] = repository
+    for name in defaults:
+        if not hasattr(bb, name):
+            setattr(bb, name, getattr(parsing, name))
+    if not hasattr(bb, "Repository"):
+        bb.Repository = repository.Repository
 
 
 _install_fakes()
+
+
+def _gvf(cam, start, end):
+    """The get_video_fname that is ACTUALLY installed.
+
+    Either fake may have won the race above, and they use different stem shapes,
+    so tests must build .bbb names with the same function the code under test uses.
+    """
+    from bb_binary.parsing import get_video_fname
+    return get_video_fname(cam, start, end)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + "/..")
 
 import pandas as pd  # noqa: E402
@@ -85,8 +146,8 @@ def dt(day, h, m=0):
 
 def bbb_row(cam, start, end, mtime, size=4096):
     return {
-        "file_name": _get_video_fname(cam, start, end) + ".bbb",
-        "full_path": f"/repo/{_get_video_fname(cam, start, end)}.bbb",
+        "file_name": _gvf(cam, start, end) + ".bbb",
+        "full_path": f"/repo/{_gvf(cam, start, end)}.bbb",
         "starttime": start, "endtime": end,
         "modified_time": mtime, "file_size": size,
     }
