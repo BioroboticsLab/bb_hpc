@@ -5,6 +5,7 @@ from datetime import datetime, timezone, timedelta
 
 from bb_hpc import settings
 from bb_hpc.src.generate import generate_jobs_rpi_detect
+from bb_hpc.running_k8s.k8s_utils import resolve_workers, apply_workers_env
 
 
 def parse_args():
@@ -18,6 +19,13 @@ def parse_args():
         nargs="+",
         default=[yesterday, today],
         help="YYYYMMDD strings (UTC). Default: yesterday & today.",
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Workers per pod (or per GPU, if the RPi resources request one). Overrides "
+             "rpi_detect_settings['workers_per_pod'/'workers_per_gpu'] and the global k8s env.",
     )
     p.add_argument(
         "--dry-run",
@@ -51,7 +59,8 @@ def write_filelist(dir_host: Path, idx: int, videos_hpc):
 
 def make_indexed_job(job_name: str, completions: int, parallelism: int,
                      filelist_dir_pod: str, runner_path: str, use_clahe: bool,
-                     model_type: str = "default", polo_config: dict = None):
+                     model_type: str = "default", polo_config: dict = None,
+                     workers: int = None):
     """
     Build a single Job with Indexed completions.
     Each Pod computes: FILELIST=.../videos_${JOB_COMPLETION_INDEX}.txt
@@ -92,13 +101,9 @@ def make_indexed_job(job_name: str, completions: int, parallelism: int,
 
     workers_env_var = "WORKERS_PER_GPU" if _has_gpu(resources) else "WORKERS_PER_POD"
 
-    # Inject a default for the chosen workers var if not already present
-    if not any(e["name"] == workers_env_var for e in env_list):
-        default_workers = k.get("job", {}).get(
-            "workers_per_gpu" if workers_env_var == "WORKERS_PER_GPU" else "workers_per_pod",
-            2,
-        )
-        env_list.append({"name": workers_env_var, "value": str(default_workers)})
+    # Resolve the chosen workers var: CLI > rpi_detect_settings > global env > k8s["job"] > 2
+    n_workers = resolve_workers(workers_env_var, workers, settings.rpi_detect_settings)
+    env_list = apply_workers_env(env_list, workers_env_var, n_workers)
 
     # Bash payload:
     # - double the braces around any Bash ${...} usage so Python doesn't try to format them
@@ -265,6 +270,7 @@ def main():
             use_clahe        = use_clahe,
             model_type       = model_type,
             polo_config      = polo_config if model_type == "polo" else None,
+            workers          = args.workers,
         )
 
         spec_path = filelist_dir_host / f"{full_job_name}.json"

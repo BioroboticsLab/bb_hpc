@@ -6,6 +6,7 @@ from datetime import datetime, timezone, timedelta
 from bb_hpc import settings
 from bb_hpc.src.generate import generate_jobs_tracking
 from bb_hpc.src.repo_guard import assert_clean_repo_root
+from bb_hpc.running_k8s.k8s_utils import resolve_workers, apply_workers_env
 
 
 def parse_args():
@@ -16,6 +17,9 @@ def parse_args():
     p = argparse.ArgumentParser(description="Submit tracking shards to Kubernetes (Indexed Job)")
     p.add_argument("--dates", nargs="+", default=[yesterday, today],
                    help="YYYYMMDD strings (UTC). Default: yesterday & today.")
+    p.add_argument("--workers", type=int, default=None,
+                   help="Workers for the active mode (WORKERS_PER_GPU when track_settings['gpu'] "
+                        "is true, else WORKERS_PER_POD). Overrides track_settings and global env.")
     p.add_argument("--dry-run", action="store_true",
                    help="Write filelists & Job spec, but do not kubectl apply.")
     return p.parse_args()
@@ -186,13 +190,14 @@ def main():
     # Base env from Kubernetes settings
     base_env = [{"name": k_, "value": str(v_)} for k_, v_ in settings.k8s.get("env", {}).items()]
 
-    # Ensure worker env knobs are present
-    if not any(e["name"] == "WORKERS_PER_GPU" for e in base_env):
-        wpg = str(settings.k8s.get("job", {}).get("workers_per_gpu", 2))
-        base_env.append({"name": "WORKERS_PER_GPU", "value": wpg})
-    if not any(e["name"] == "WORKERS_PER_POD" for e in base_env):
-        wpp = str(settings.k8s.get("job", {}).get("workers_per_pod", 2))
-        base_env.append({"name": "WORKERS_PER_POD", "value": wpp})
+    # Resolve both worker knobs: CLI > track_settings > global env > k8s["job"] > 2.
+    # --workers applies only to the knob the entrypoint will actually read.
+    active_var = "WORKERS_PER_GPU" if gpu_enabled else "WORKERS_PER_POD"
+    for var in ("WORKERS_PER_GPU", "WORKERS_PER_POD"):
+        n = resolve_workers(var, args.workers if var == active_var else None, s)
+        base_env = apply_workers_env(base_env, var, n)
+        if var == active_var:
+            print(f"{'GPU' if gpu_enabled else 'CPU'} mode: {var}={n}")
 
     # Flag to tell the entrypoint which worker knob to use
     base_env.append({"name": "GPU_ENABLED", "value": "1" if gpu_enabled else "0"})

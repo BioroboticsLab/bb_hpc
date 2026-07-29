@@ -61,6 +61,10 @@ save_detect_settings = {
     "chunk_size": 50,
     "maxjobs": None,
     "jobname": "save_detect",
+    # K8s: workers per pod for this job only. Overrides the global k8s["env"]["WORKERS_PER_POD"],
+    # which is sized for detect's memory limit -- save-detect gets far less, so inheriting
+    # detect's count OOM-kills the pod (exit 137). Override at submit time with --workers.
+    "workers_per_pod": 2,
     # per-job Slurm overrides (optional)
     "slurm": {
         "max_memory": "8GB",

@@ -6,12 +6,16 @@ from datetime import datetime
 from bb_hpc import settings
 from bb_hpc.src.generate import generate_jobs_save_detect
 from bb_hpc.src.repo_guard import assert_clean_repo_root
+from bb_hpc.running_k8s.k8s_utils import resolve_workers, apply_workers_env
 import re
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--dates", nargs="+", required=True,
                    help="YYYYMMDD (one or many). Example: 20250901 20250902")
+    p.add_argument("--workers", type=int, default=None,
+                   help="Workers per pod. Overrides save_detect_settings['workers_per_pod'] "
+                        "and the global k8s env WORKERS_PER_POD.")
     p.add_argument("--dry-run", action="store_true",
                    help="Write filelists & Job spec, but do not kubectl apply.")
     return p.parse_args()
@@ -34,11 +38,15 @@ def write_filelist(dir_host: Path, idx: int, job_args_list):
     return f
 
 def make_indexed_job(job_name: str, completions: int, parallelism: int,
-                     filelist_dir_pod: str, runner_path: str):
+                     filelist_dir_pod: str, runner_path: str, workers: int = None):
     k = settings.k8s
     env_list = [{"name": k_, "value": str(v_)} for k_, v_ in k.get("env", {}).items()]
     # Prefer a CPU-only resources block for save-detect if provided
     resources = k.get("resources_save_detect", k["resources"])
+
+    # save-detect is memory-hungry per worker; don't inherit detect's global count.
+    workers = resolve_workers("WORKERS_PER_POD", workers, settings.save_detect_settings)
+    env_list = apply_workers_env(env_list, "WORKERS_PER_POD", workers)
 
     bash = f"""\
 set -euo pipefail
@@ -202,6 +210,7 @@ def main():
         parallelism     = par,
         filelist_dir_pod= str(filelist_dir_pod),
         runner_path     = runner_path,
+        workers         = resolve_workers("WORKERS_PER_POD", args.workers, s),
     )
 
     spec_path = filelist_dir_host / f"{full_job_name}.json"
@@ -209,7 +218,9 @@ def main():
     with open(spec_path, "w") as f:
         json.dump(job_dict, f, indent=2)
 
-    print(f"Wrote {spec_path}  (completions={len(filelists)}, parallelism={par})")
+    workers = resolve_workers("WORKERS_PER_POD", args.workers, s)
+    print(f"Wrote {spec_path}  (completions={len(filelists)}, parallelism={par}, "
+          f"workers_per_pod={workers})")
 
     if args.dry_run:
         print("Dry run: not applying Job.")
