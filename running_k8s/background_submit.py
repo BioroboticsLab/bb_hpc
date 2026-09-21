@@ -27,6 +27,11 @@ def parse_args():
                    help="Output base for --source-dir mode (default: settings.backgrounds_dir_hpc).")
     p.add_argument("--cams", nargs="+", default=None,
                    help="Optional camera filter, e.g. --cams cam-0 cam-1.")
+    p.add_argument("--window", default=None,
+                   help='Override background_window: "hour", "day", or seconds (e.g. 14400).')
+    p.add_argument("--window-tz", default=None,
+                   help="Override background_window_tz: anchor windows at local midnight in this "
+                        "zone, e.g. Europe/Berlin (default: settings, else UTC).")
     p.add_argument("--dry-run", action="store_true",
                    help="Write filelists & Job spec, but do not kubectl apply.")
     args = p.parse_args()
@@ -126,6 +131,10 @@ def main():
     args = parse_args()
 
     s = settings.background_settings
+    window = s.get("background_window", None)
+    if args.window is not None:
+        window = int(args.window) if args.window.isdigit() else args.window
+    window_tz = args.window_tz if args.window_tz is not None else s.get("background_window_tz", None)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     filelist_dir_host = Path(settings.jobdir_local) / "k8s" / "background" / stamp
     filelist_dir_pod = Path(settings.jobdir_hpc) / "k8s" / "background" / stamp
@@ -135,7 +144,7 @@ def main():
         backgrounds_root_dir = str(Path(settings.backgrounds_dir_local)),
         datestring           = args.dates,
         frame_interval_sec   = s.get("frame_interval_sec", None),
-        background_window    = s.get("background_window", None),
+        background_window    = window,
         window_size          = int(s.get("window_size", 10)),
         num_median_images    = int(s.get("num_median_images", 200)),
         max_cycles           = s.get("max_cycles", None),
@@ -153,6 +162,10 @@ def main():
         cams                 = args.cams,
         dates                = args.dates if args.source_dir else None,  # source-dir: per-day shard
         min_frames           = int(s.get("min_frames", 3)),
+        window_tz            = window_tz,
+        # Frames may live on storage only the pods mount (e.g. cephfs); then
+        # enumerate (date, cam) from the videos and let the engine skip done work.
+        video_root_dir       = str(Path(settings.videodir_local)),
     ))
     if not chunks:
         print("No background work to submit.")

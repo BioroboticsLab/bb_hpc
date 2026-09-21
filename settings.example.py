@@ -100,7 +100,7 @@ frame_extract_settings = {
     "interval_in_sec": 60,       # seconds between extracted frames
     "fps": 3,
     "file_format": "png",
-    "max_workers": 2,
+    "max_workers": 2,            # cams of one date decoded in parallel inside a task
     "decoder": "hevc_cuvid",     # NVIDIA NVDEC; use None/"none" for software decode
     "slurm": {
         "max_memory": "8GB",
@@ -119,6 +119,8 @@ background_settings = {
     # domain knobs forwarded to BgImageGenConfig:
     "frame_interval_sec": None,  # None = use every extracted frame
     "background_window": None,   # None = count-based; or "hour" / "day" / <seconds>
+    "background_window_tz": None,  # None = windows anchored at UTC midnight; or e.g. "Europe/Berlin"
+                                   # to anchor at local midnight (matches local-date video folders)
     "window_size": 10,
     "num_median_images": 200,
     "max_cycles": None,

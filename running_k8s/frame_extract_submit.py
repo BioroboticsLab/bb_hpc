@@ -25,6 +25,9 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--dates", nargs="+", required=True,
                    help="YYYYMMDD (one or many). Example: 20250603 20250604")
+    p.add_argument("--interval", type=int, default=None,
+                   help="Override interval_in_sec (seconds between frames; divisor of 60 or "
+                        "multiple of 60). 15 -> 4 frames per 1-min video.")
     p.add_argument("--dry-run", action="store_true",
                    help="Write filelists & Job spec, but do not kubectl apply.")
     return p.parse_args()
@@ -129,7 +132,7 @@ def main():
         video_root_dir  = str(Path(settings.videodir_local)),
         frames_root_dir = str(Path(settings.frames_dir_local)),
         datestring      = args.dates,
-        interval_in_sec = int(s.get("interval_in_sec", 60)),
+        interval_in_sec = args.interval or int(s.get("interval_in_sec", 60)),
         fps             = int(s.get("fps", 3)),
         file_format     = s.get("file_format", "png"),
         decoder         = s.get("decoder", "hevc_cuvid"),

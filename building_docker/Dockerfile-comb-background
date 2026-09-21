@@ -60,6 +60,10 @@ ARG CELLSEG_REPO_REF=bbhpc-integration
 # below sm_75, so a 1080 Ti hits "no kernel image available". Use cu126 only for
 # Blackwell-only nodes (sm_100/sm_120).
 ARG TORCH_CUDA=cu118
+# Cache-bust: this file's content is the branch head commit, so the clone layer
+# below is rebuilt whenever the branch moves (otherwise `docker build` reuses a
+# stale clone and the build-time check below fails on missing features).
+ADD https://api.github.com/repos/BioroboticsLab/honeybee_cell_segmentation_pipeline/git/refs/heads/${CELLSEG_REPO_REF} /tmp/cellseg-ref.json
 RUN set -euo pipefail && \
     git clone --depth=1 --branch "$CELLSEG_REPO_REF" "$CELLSEG_REPO_URL" honeybee_cell_segmentation_pipeline && \
     cd honeybee_cell_segmentation_pipeline && \
@@ -70,10 +74,11 @@ RUN set -euo pipefail && \
         torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1
 
 # Build-time sanity check: torch imports and the bb_hpc-facing API is present
-# (cams=/dates= prove we built the bbhpc-integration branch). Written as a single
+# (cams=/dates= prove we built the bbhpc-integration branch; window_tz proves it
+# is recent enough for local-time background windows). Written as a single
 # `python -c` line because the miniforge stage uses SHELL ["/bin/bash","-lc"],
 # under which a RUN heredoc is NOT fed to stdin (it silently becomes a no-op).
-RUN python -c "import inspect, torch; from background_generator.background_img_generator import BackgroundImageGenerator as B; sig = inspect.signature(B.__init__); print('Torch:', torch.__version__); print('BackgroundImageGenerator.__init__', sig); assert 'cams' in sig.parameters and 'dates' in sig.parameters, 'wrong branch: need bbhpc-integration (cams=/dates= missing)'"
+RUN python -c "import inspect, torch; from background_generator.background_img_generator import BackgroundImageGenerator as B; sig = inspect.signature(B.__init__); print('Torch:', torch.__version__); print('BackgroundImageGenerator.__init__', sig); assert 'cams' in sig.parameters and 'dates' in sig.parameters, 'wrong branch: need bbhpc-integration (cams=/dates= missing)'; from background_generator.utils import BgImageGenConfig as C; assert 'window_tz' in C.model_fields, 'engine too old: BgImageGenConfig.window_tz missing'"
 
 # The frame extractor finds ffmpeg on PATH automatically (determine_ffmpeg_bin_path).
 # NOTE: the apt ffmpeg may lack NVDEC (hevc_cuvid). For GPU decode supply a

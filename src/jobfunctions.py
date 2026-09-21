@@ -1011,45 +1011,58 @@ def job_for_process_rpi_videos(video_paths=None, clahe=True, model_type="default
 ##### FRAME EXTRACT (cell-seg heavy preprocessing)
 #################################################################
 def job_for_frame_extract_chunk(work_units):
-    """Extract frames for a list of (date, camera) units in one SLURM task.
+    """Extract frames for a list of (date, camera) units in one task.
 
     Each element of ``work_units`` is a self-contained dict produced by
     generate_jobs_frame_extract (date, cam, video_root, frames_root, plus the
-    domain knobs). Imports are inline so slurmhelper can embed this function
-    standalone. Per-unit errors are contained so one bad camera does not abort
-    the rest of the chunk; the task exits nonzero if any unit failed.
+    domain knobs). Units that share a date and knobs run in ONE
+    GlobalVideoProcessor call with all their cams, so the engine's per-camera
+    threads (``max_workers``) decode those cams in parallel instead of one video
+    at a time. Imports are inline so slurmhelper can embed this function
+    standalone. Per-date errors are contained so one bad date does not abort the
+    rest of the chunk; the task exits nonzero if any date failed.
+
+    After each date, every cam's frames on disk are compared with the expected
+    set: the engine logs per-video ffmpeg failures only to frame_extractor.log
+    and still returns normally, so this is the visible completeness signal.
     """
     import gc
+    import os
     from pathlib import Path
 
     if not work_units:
         return True
 
-    total = len(work_units)
+    # (date, roots, knobs) -> [cam, ...], in first-seen order.
+    groups = {}
+    for u in work_units:
+        decoder = u.get("decoder", "hevc_cuvid")
+        if isinstance(decoder, str) and decoder.lower() == "none":
+            decoder = None
+        key = (u["date"], u["video_root"], u["frames_root"], u.get("interval_in_sec", 60),
+               u.get("fps", 3), u.get("file_format", "png"), decoder, u.get("max_workers", 2))
+        groups.setdefault(key, []).append(u["cam"])
+
+    total = len(groups)
     failures = 0
-    for i, u in enumerate(work_units, 1):
-        date = u["date"]
-        cam = u["cam"]
-        print(f"[frame_extract_chunk] unit {i}/{total}: {date}/{cam}", flush=True)
+    for i, (key, cams) in enumerate(groups.items(), 1):
+        date, video_root, frames_root, interval, fps, file_format, decoder, max_workers = key
+        out_dir = Path(frames_root) / date  # engine appends the cam-N subdir
+        print(f"[frame_extract_chunk] date {i}/{total}: {date} cams={cams} "
+              f"max_workers={max_workers}", flush=True)
         try:
             from frame_extractor.global_video_processor import GlobalVideoProcessor
 
-            out_dir = Path(u["frames_root"]) / date  # engine appends the cam-N subdir
             out_dir.mkdir(parents=True, exist_ok=True)
-
-            decoder = u.get("decoder", "hevc_cuvid")
-            if isinstance(decoder, str) and decoder.lower() == "none":
-                decoder = None
-
             proc = GlobalVideoProcessor(
-                base_dir=Path(u["video_root"]),
+                base_dir=Path(video_root),
                 out_dir=out_dir,
-                file_format=u.get("file_format", "png"),
-                interval_in_sec=u.get("interval_in_sec", 60),
-                max_workers=u.get("max_workers", 2),
-                fps=u.get("fps", 3),
+                file_format=file_format,
+                interval_in_sec=interval,
+                max_workers=max_workers,
+                fps=fps,
                 dates=[date],
-                cams=[cam],
+                cams=cams,
                 decoder=decoder,
             )
             proc.run()
@@ -1057,11 +1070,26 @@ def job_for_frame_extract_chunk(work_units):
             failures += 1
             import traceback
             traceback.print_exc()
-            print(f"[frame_extract_chunk] unit {i}/{total} FAILED ({e})", flush=True)
+            print(f"[frame_extract_chunk] date {i}/{total} FAILED ({e})", flush=True)
         finally:
             gc.collect()
 
-    print(f"[frame_extract_chunk] done: {total - failures}/{total} ok, {failures} failed", flush=True)
+        try:
+            from frame_extractor.naming import expected_frame_filenames
+
+            for cam in cams:
+                mp4s = sorted((Path(video_root) / date / cam).glob("*.mp4"))
+                txts = [t for t in (v.with_suffix(".txt") for v in mp4s) if t.exists()]
+                expected = expected_frame_filenames(txts, interval, fps, file_format)
+                cam_out = out_dir / cam
+                present = expected & set(os.listdir(cam_out)) if cam_out.is_dir() else set()
+                print(f"[frame_extract_chunk] {date}/{cam}: {len(present)}/{len(expected)} frames present"
+                      + ("" if len(present) == len(expected) else f" (see {out_dir}/frame_extractor.log)"),
+                      flush=True)
+        except Exception as e:
+            print(f"[frame_extract_chunk] {date}: coverage check skipped ({e!r})", flush=True)
+
+    print(f"[frame_extract_chunk] done: {total - failures}/{total} dates ok, {failures} failed", flush=True)
     if failures:
         import sys
         sys.exit(1)
@@ -1119,12 +1147,20 @@ def job_for_background_chunk(work_units):
                 background_window=u.get("background_window", None),
                 memmap_dir=u.get("memmap_dir", None),
                 min_frames=u.get("min_frames", 3),
+                window_tz=u.get("window_tz", None),
             )
             # Drop None-valued optional knobs so the engine's own defaults apply.
             # (BgImageGenConfig.max_cycles is typed `int` with default None, so
             # passing None explicitly trips pydantic validation; for every optional
             # knob here None == the engine default, so dropping None is equivalent.)
             cfg_kwargs = {k: v for k, v in cfg_kwargs.items() if v is not None}
+            # An engine build without window_tz would silently ignore it (pydantic
+            # drops unknown fields) and write UTC-anchored windows; fail instead.
+            known = getattr(BgImageGenConfig, "model_fields", None) or getattr(BgImageGenConfig, "__fields__", {})
+            if "window_tz" in cfg_kwargs and "window_tz" not in known:
+                raise RuntimeError(
+                    "window_tz is set but this background_generator build does not support it; "
+                    "rebuild the comb-background image from the bbhpc-integration branch")
             config = BgImageGenConfig(**cfg_kwargs)
 
             gen_kwargs = dict(

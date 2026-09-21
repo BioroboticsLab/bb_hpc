@@ -209,13 +209,23 @@ Both accept `--dates` and `--dry-run`. Work is sharded by **(date, camera)**;
 `settings.frame_extract_settings` / `settings.background_settings`:
 
 - **Frame extraction:** `interval_in_sec` (seconds between frames — the key
-  knob), `fps`, `file_format`, `max_workers`, `decoder` (`hevc_cuvid` for
-  NVIDIA NVDEC, or `None`/`"none"` for CPU software decode).
+  knob; e.g. 15 → 4 frames per 1-min video), `fps` (must match the videos: 6 in
+  2026), `file_format`, `max_workers` (cams of one date decoded in parallel inside
+  a task), `decoder` (`hevc_cuvid` for NVIDIA NVDEC, or `None`/`"none"` for CPU
+  software decode).
 - **Background generation:** `frame_interval_sec` (subsample frames, e.g. compare
   5-min vs 10-min backgrounds), `background_window` (`"hour"`/`"day"`/seconds —
-  one background per window; `None` = count-based rolling mode), plus
-  `window_size`, `num_median_images`, `mask_dilation`, `median_computation`,
-  `device`, etc.
+  one background per window; `None` = count-based rolling mode),
+  `background_window_tz` (e.g. `"Europe/Berlin"`: windows start at local midnight,
+  matching the local-date video folders; `None` = UTC midnight), plus
+  `window_size`, `num_median_images`, `min_frames`, `mask_dilation`,
+  `median_computation`, `device`, etc.
+
+On k8s, `frame_extract_submit --interval N` and
+`background_submit --window hour|day|<sec> --window-tz <zone>` override the
+settings for one submit. Masked frames are shared across window configs, so run
+hourly first, then e.g. `--window 14400 --window-tz Europe/Berlin` once it has
+finished (never both at once).
 
 **Skip / "what's left to do":** both stages skip already-done `(date, camera)`
 units by checking the **expected output filenames**. For extraction this means a
@@ -227,6 +237,15 @@ the pending unit count before submitting.
 
 **Outputs:** `settings.frames_dir_*` (e.g. `results/data_extracted_frames/<date>/cam-N/`)
 and `settings.backgrounds_dir_*` (e.g. `results/data_backgrounds/<date>/cam-N/<config-tag>/`).
+
+**Pod-only storage (e.g. cephfs `/abyss`):** the frames/backgrounds dirs may live
+on storage that only the pods mount. Set both `_local` and `_hpc` to the pod path;
+`background_submit` then sees no frames root on the submit host and schedules
+every `(date, cam)` that has videos (the engine skips finished work itself). Look
+at the outputs from a throwaway pod with the same mounts:
+`python -m bb_hpc.running_k8s.inspect_pod --up` (then `kubectl exec -it … -- bash`),
+and `--down` when done. `/abyss/home` is the home of the kubectl context that
+submitted the job, so submit every stage under the same context.
 
 **GPU note:** both stages request `gres=gpu:1`. Frame extraction's default
 `hevc_cuvid` needs NVDEC (a CUDA build of ffmpeg); on CPU-only nodes set

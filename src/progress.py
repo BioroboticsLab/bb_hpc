@@ -572,6 +572,7 @@ def background_progress(frames_dir: str, backgrounds_dir: str, dates: Sequence[s
     wsize = int(s.get("window_size", 10))
     nmed = int(s.get("num_median_images", 200))
     min_frames = int(s.get("min_frames", 3))
+    window_tz = s.get("background_window_tz", None)
 
     rows, notes = [], []
     scopes = G.iter_background_scopes(frames_dir, backgrounds_dir, list(dates))
@@ -585,7 +586,7 @@ def background_progress(frames_dir: str, backgrounds_dir: str, dates: Sequence[s
                 continue
 
             out_cam_dir = os.path.join(output_path, cam)
-            tag, note = G.resolve_background_tag(out_cam_dir, interval, window, wsize, nmed)
+            tag, note = G.resolve_background_tag(out_cam_dir, interval, window, wsize, nmed, window_tz)
             if note and note not in notes:
                 notes.append(note)
             out_tag_dir = os.path.join(out_cam_dir, tag)
@@ -593,7 +594,7 @@ def background_progress(frames_dir: str, backgrounds_dir: str, dates: Sequence[s
             kept = G.background_kept_count(frame_names, interval)
             if window and kept < min_frames:
                 status = "skipped_min_frames"
-            elif G.background_is_done(out_tag_dir, frame_names, interval, window):
+            elif G.background_is_done(out_tag_dir, frame_names, interval, window, window_tz):
                 status = "done"
             else:
                 status = "pending"

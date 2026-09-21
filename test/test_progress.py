@@ -353,6 +353,87 @@ def test_config_tag_fallback_matches_engine_when_available():
     ]:
         assert G._config_tag_fallback(interval, window, wsize, nmed) == \
             windowing.config_tag(interval, window, wsize, nmed)
+    if "window_tz" not in windowing.config_tag.__code__.co_varnames:
+        pytest.skip("installed background_generator predates window_tz")
+    assert G._config_tag_fallback(None, 14400, 10, 200, "Europe/Berlin") == \
+        windowing.config_tag(None, 14400, 10, 200, "Europe/Berlin")
+    names = _frame_names("20260909T220027", "20260910T015945", "20260910T020012",
+                         "20261024T215900", "20261025T021500", "20261025T221500")
+    for window, tz in [(14400, "Europe/Berlin"), ("hour", "Europe/Berlin"), ("day", "Europe/Berlin"),
+                       (14400, None)]:
+        assert G._expected_background_names_fallback(names, None, window, tz) == \
+            windowing.expected_background_names(names, None, window, tz)
+
+
+# --------------------------------------------------------------------------- #
+# window_tz: windows anchored at local midnight (local-date video folders)
+# --------------------------------------------------------------------------- #
+def _frame_names(*stamps):
+    return [f"cam-0_{t}.000000.000Z.png" for t in stamps]
+
+
+def _bg(stamp):
+    return f"background_{stamp}.000000.000Z.png"
+
+
+def test_tz_windows_start_at_local_midnight():
+    # 20260910/ holds 2026-09-09T22:00Z .. 2026-09-10T22:00Z (CEST = UTC+2).
+    names = _frame_names("20260909T223000", "20260910T015900", "20260910T020000", "20260910T215959")
+    got = G._expected_background_names_fallback(names, None, 14400, "Europe/Berlin")
+    assert got == {_bg("20260909T220000"), _bg("20260910T020000"), _bg("20260910T180000")}
+    # Without a zone the same frames split at UTC midnight instead.
+    utc = G._expected_background_names_fallback(names, None, 14400)
+    assert _bg("20260909T200000") in utc and _bg("20260910T000000") in utc
+
+
+def test_tz_windows_on_dst_day_end_with_a_short_window():
+    # 2026-10-25: local midnight is 22:00Z the day before, the next one is 23:00Z.
+    names = _frame_names("20261024T223000", "20261025T213000", "20261025T223000", "20261025T233000")
+    got = G._expected_background_names_fallback(names, None, 14400, "Europe/Berlin")
+    assert got == {_bg("20261024T220000"), _bg("20261025T180000"),
+                   _bg("20261025T220000"),   # the 1-hour 22:00Z-23:00Z window
+                   _bg("20261025T230000")}   # next day's first window
+
+
+def test_tz_hour_windows_match_utc_hours_on_a_normal_day():
+    names = _frame_names(*[f"20260910T{h:02d}3000" for h in range(24)])
+    assert G._expected_background_names_fallback(names, None, "hour", "Europe/Berlin") == \
+        G._expected_background_names_fallback(names, None, "hour")
+
+
+def test_tz_is_part_of_the_config_tag():
+    assert G._config_tag_fallback(None, 14400, 10, 200, "Europe/Berlin") == \
+        "int0s_win14400_tzEurope-Berlin"
+    assert G._config_tag_fallback(None, "hour", 10, 200) == "int0s_winhour"
+
+
+def test_blind_background_enumerates_from_videos(tmp_path, capsys):
+    """Frames root invisible on the submit host (pod-only cephfs): schedule every
+    (date, cam) that has videos + .txt, with no done-checks, carrying window_tz."""
+    videodir, _frames = _seed_frames(tmp_path)
+    invisible = str(tmp_path / "not-mounted" / "frames")
+    bg = str(tmp_path / "not-mounted" / "bg")
+    units = [u for ch in G.generate_jobs_background(
+        invisible, bg, ["20260701"], background_window=14400, window_tz="Europe/Berlin",
+        chunk_size=99, video_root_dir=videodir) for u in ch["work_units"]]
+    assert {(u["date"], u["cam"]) for u in units} == {("20260701", "cam-0"), ("20260701", "cam-1")}
+    assert all(u["window_tz"] == "Europe/Berlin" and u["background_window"] == 14400 for u in units)
+    assert all(u["frames_root"] == invisible and u["backgrounds_root"] == bg for u in units)
+    assert "not visible on this host" in capsys.readouterr().out
+
+    only = [u for ch in G.generate_jobs_background(
+        invisible, bg, ["20260701"], background_window="hour", chunk_size=99,
+        video_root_dir=videodir, cams=["cam-1"]) for u in ch["work_units"]]
+    assert [u["cam"] for u in only] == ["cam-1"]
+
+
+def test_visible_frames_root_ignores_video_root(tmp_path):
+    """With the frames visible, the normal done-checks apply even if video_root_dir is passed."""
+    frames, bg = _seed_background(tmp_path)
+    units = [u for ch in G.generate_jobs_background(
+        frames, bg, ["20260701"], window_size=10, num_median_images=200, chunk_size=99,
+        video_root_dir=str(tmp_path / "videos")) for u in ch["work_units"]]
+    assert {(u["date"], u["cam"]) for u in units} == {("20260701", "cam-1")}
 
 
 def test_resolve_background_tag_heals_a_wrong_guess(tmp_path):

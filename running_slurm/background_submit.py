@@ -74,6 +74,7 @@ def main():
         cams                 = args.cams,
         dates                = args.dates if args.source_dir else None,  # source-dir: per-day shard
         min_frames           = int(s.get("min_frames", 3)),
+        window_tz            = s.get("background_window_tz", None),
     ))
     if not chunks:
         print("No work to submit.")

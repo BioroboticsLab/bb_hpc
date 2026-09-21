@@ -815,7 +815,8 @@ def generate_jobs_frame_extract(
 #################################################################
 ##### BACKGROUND (cell-seg heavy preprocessing)
 #################################################################
-def _expected_background_names_fallback(frame_names, frame_interval_sec, background_window):
+def _expected_background_names_fallback(frame_names, frame_interval_sec, background_window,
+                                        window_tz=None):
     """Dependency-free mirror of ``background_generator.windowing.expected_background_names``.
 
     Lets the SUBMIT HOST compute the exact per-window background output filenames
@@ -825,7 +826,7 @@ def _expected_background_names_fallback(frame_names, frame_interval_sec, backgro
     and is used instead whenever it is importable.
     """
     import re as _re
-    from datetime import datetime as _dt, timedelta as _td
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
 
     def _ts(name):
         m = _re.search(r"(\d{8}T\d{6})", name)
@@ -837,6 +838,16 @@ def _expected_background_names_fallback(frame_names, frame_interval_sec, backgro
             return None
 
     def _bucket(ts):
+        if window_tz:
+            from zoneinfo import ZoneInfo
+            utc = ts.replace(tzinfo=_tz.utc)
+            day0 = utc.astimezone(ZoneInfo(window_tz)).replace(
+                hour=0, minute=0, second=0, microsecond=0).astimezone(_tz.utc)
+            if background_window == "day":
+                return day0.replace(tzinfo=None)
+            sec = 3600 if background_window == "hour" else int(background_window)
+            off = int((utc - day0).total_seconds())
+            return (day0 + _td(seconds=(off // sec) * sec)).replace(tzinfo=None)
         if background_window == "hour":
             return ts.replace(minute=0, second=0, microsecond=0)
         if background_window == "day":
@@ -866,7 +877,8 @@ def _expected_background_names_fallback(frame_names, frame_interval_sec, backgro
     return {"background_" + b.strftime("%Y%m%dT%H%M%S") + ".000000.000Z.png" for b in buckets}
 
 
-def _config_tag_fallback(frame_interval_sec, background_window, window_size, num_median_images):
+def _config_tag_fallback(frame_interval_sec, background_window, window_size, num_median_images,
+                         window_tz=None):
     """Dependency-free mirror of ``background_generator.windowing.config_tag``.
 
     The config tag names the output subdirectory
@@ -878,16 +890,24 @@ def _config_tag_fallback(frame_interval_sec, background_window, window_size, num
     """
     interval = frame_interval_sec or 0
     if background_window:
-        return f"int{interval}s_win{background_window}"
+        tag = f"int{interval}s_win{background_window}"
+        if window_tz:
+            tag += "_tz" + window_tz.replace("/", "-")
+        return tag
     return f"count_w{window_size}_n{num_median_images}_int{interval}s"
 
 
-def background_config_tag(frame_interval_sec, background_window, window_size, num_median_images):
+def background_config_tag(frame_interval_sec, background_window, window_size, num_median_images,
+                          window_tz=None):
     """Canonical config tag when background_generator is importable, else the mirror."""
     w = _import_windowing()
     if w is not None:
+        if window_tz:
+            return w.config_tag(frame_interval_sec, background_window, window_size, num_median_images,
+                                window_tz)
         return w.config_tag(frame_interval_sec, background_window, window_size, num_median_images)
-    return _config_tag_fallback(frame_interval_sec, background_window, window_size, num_median_images)
+    return _config_tag_fallback(frame_interval_sec, background_window, window_size, num_median_images,
+                                window_tz)
 
 
 def list_background_tag_dirs(out_cam_dir):
@@ -899,7 +919,7 @@ def list_background_tag_dirs(out_cam_dir):
 
 
 def resolve_background_tag(out_cam_dir, frame_interval_sec, background_window,
-                           window_size, num_median_images):
+                           window_size, num_median_images, window_tz=None):
     """
     Return (tag, note) -- the config-tag dir to check for existing backgrounds.
 
@@ -915,11 +935,12 @@ def resolve_background_tag(out_cam_dir, frame_interval_sec, background_window,
     """
     import os
 
-    w = _import_windowing()
-    if w is not None:
-        return w.config_tag(frame_interval_sec, background_window, window_size, num_median_images), None
+    if _import_windowing() is not None:
+        return background_config_tag(frame_interval_sec, background_window, window_size,
+                                     num_median_images, window_tz), None
 
-    tag = _config_tag_fallback(frame_interval_sec, background_window, window_size, num_median_images)
+    tag = _config_tag_fallback(frame_interval_sec, background_window, window_size, num_median_images,
+                               window_tz)
     if os.path.isdir(os.path.join(out_cam_dir, tag)):
         return tag, None
 
@@ -938,12 +959,16 @@ def resolve_background_tag(out_cam_dir, frame_interval_sec, background_window,
     return tag, None
 
 
-def background_expected_names(frame_names, frame_interval_sec, background_window):
+def background_expected_names(frame_names, frame_interval_sec, background_window, window_tz=None):
     """Exact per-window background_*.png names the engine will produce."""
     w = _import_windowing()
     if w is not None:
+        if window_tz:
+            return w.expected_background_names(frame_names, frame_interval_sec, background_window,
+                                               window_tz)
         return w.expected_background_names(frame_names, frame_interval_sec, background_window)
-    return _expected_background_names_fallback(frame_names, frame_interval_sec, background_window)
+    return _expected_background_names_fallback(frame_names, frame_interval_sec, background_window,
+                                               window_tz)
 
 
 def background_kept_count(frame_names, frame_interval_sec):
@@ -965,7 +990,8 @@ def background_day_of(name):
     return m.group(1) if m else None
 
 
-def background_is_done(out_cam_tag_dir, frame_names, frame_interval_sec, background_window):
+def background_is_done(out_cam_tag_dir, frame_names, frame_interval_sec, background_window,
+                       window_tz=None):
     """
     Window mode: every expected per-window background_<ts>.png exists.
     Count/rolling mode (background_window=None): any background_*.png is 'done enough'.
@@ -973,7 +999,8 @@ def background_is_done(out_cam_tag_dir, frame_names, frame_interval_sec, backgro
     import os
 
     if background_window:
-        expected = background_expected_names(frame_names, frame_interval_sec, background_window)
+        expected = background_expected_names(frame_names, frame_interval_sec, background_window,
+                                             window_tz)
         if not expected:
             return False
         existing = set(os.listdir(out_cam_tag_dir)) if os.path.isdir(out_cam_tag_dir) else set()
@@ -1042,6 +1069,8 @@ def generate_jobs_background(
     cams=None,              # optional camera filter, e.g. ["cam-0", "cam-1"]
     dates=None,             # optional YYYYMMDD day filter; source_dir mode -> one (cam, day) unit each
     min_frames=3,           # skip a (cam, day) with fewer frames than the engine needs (windowed mode)
+    window_tz=None,         # anchor windows at local midnight in this zone, e.g. "Europe/Berlin"
+    video_root_dir=None,    # date mode: enumerate (date, cam) from videos when frames_root is not visible
 ):
     """
     Yield chunks of (scope, camera) background-generation work units.
@@ -1066,6 +1095,11 @@ def generate_jobs_background(
     so each task masks/backgrounds only that day. Days with fewer than
     ``min_frames`` frames are skipped (the engine could not produce a background
     for them, so they must not be scheduled forever).
+
+    Blind mode (date mode, ``video_root_dir`` set, ``frames_root_dir`` not a
+    directory on this host -- e.g. frames on cephfs mounted only in the pods):
+    one unit per (date, cam) that has source videos, with no done-checks. The
+    engine itself skips already-masked frames and existing window backgrounds.
     """
     import os
 
@@ -1090,6 +1124,7 @@ def generate_jobs_background(
             "device": device,
             "memmap_dir": memmap_dir,
             "min_frames": min_frames,
+            "window_tz": window_tz,
         }
 
     def _make_unit(scope_id, cam, scan_dir, output_path, explicit, day=None):
@@ -1112,10 +1147,24 @@ def generate_jobs_background(
 
     scopes = iter_background_scopes(frames_root_dir, backgrounds_root_dir, datestring,
                                     source_dir=source_dir, label=label, out_dir=out_dir)
-    tag = background_config_tag(frame_interval_sec, background_window, window_size, num_median_images)
+    tag = background_config_tag(frame_interval_sec, background_window, window_size, num_median_images,
+                                window_tz)
 
     units = []
     seen_notes = set()
+    blind = source_dir is None and video_root_dir is not None and not os.path.isdir(frames_root_dir)
+    if blind:
+        print(f"[background] frames root not visible on this host ({frames_root_dir}); scheduling "
+              f"every (date, cam) with videos under {video_root_dir}. The engine skips already-masked "
+              f"frames and existing window backgrounds.")
+        cam_filter = set(cams) if cams else None
+        for u in iter_frame_extract_units(video_root_dir, frames_root_dir, datestring):
+            if not u["txts"] or (cam_filter is not None and u["cam"] not in cam_filter):
+                continue
+            units.append(_make_unit(u["date"], u["cam"], os.path.join(frames_root_dir, u["date"]),
+                                    os.path.join(backgrounds_root_dir, u["date"]), explicit=False))
+        scopes = []
+
     for scan_dir, output_path, scope_id, explicit in scopes:
         if not os.path.isdir(scan_dir):
             if verbose:
@@ -1128,7 +1177,8 @@ def generate_jobs_background(
 
             out_cam_dir = os.path.join(output_path, cam)
             cam_tag, note = resolve_background_tag(
-                out_cam_dir, frame_interval_sec, background_window, window_size, num_median_images)
+                out_cam_dir, frame_interval_sec, background_window, window_size, num_median_images,
+                window_tz)
             if note and note not in seen_notes:
                 seen_notes.add(note)
                 print(f"[background] WARNING: {note}")
@@ -1148,13 +1198,15 @@ def generate_jobs_background(
                             print(f"[background] skip {scope_id}/{cam} {d}: "
                                   f"{len(day_frames)} frame(s) < min_frames={min_frames}")
                         continue
-                    if background_is_done(out_cam_tag_dir, day_frames, frame_interval_sec, background_window):
+                    if background_is_done(out_cam_tag_dir, day_frames, frame_interval_sec,
+                                          background_window, window_tz):
                         if verbose:
                             print(f"[background] done: {scope_id}/{cam} {d} [{cam_tag}]")
                         continue
                     units.append(_make_unit(scope_id, cam, scan_dir, output_path, explicit, day=d))
             else:
-                if background_is_done(out_cam_tag_dir, frame_names, frame_interval_sec, background_window):
+                if background_is_done(out_cam_tag_dir, frame_names, frame_interval_sec,
+                                      background_window, window_tz):
                     if verbose:
                         print(f"[background] done: {scope_id}/{cam} [{cam_tag}]")
                     continue
@@ -1165,7 +1217,7 @@ def generate_jobs_background(
         units = units[: int(chunk_size) * int(maxjobs)]
 
     print(f"[background] scopes={len(scopes)} units={len(units)} chunk_size={chunk_size} "
-          f"maxjobs={maxjobs} tag={tag}"
+          f"maxjobs={maxjobs} tag={tag}" + (" (blind)" if blind else "")
           + (f" source_dir={source_dir}" if source_dir else "")
           + (f" dates={dates_filter}" if dates_filter is not None else ""))
 
