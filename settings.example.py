@@ -192,6 +192,11 @@ k8s = {
         # files cannot abort a large run.
         # Shared by all six k8s submit scripts via settings.k8s["job"].
         "backoff_limit": 20,
+        # Delete finished Jobs (Complete AND Failed -- with their pods and logs) this
+        # many seconds after they finish, so `kubectl get jobs` only shows live work.
+        # Keep it long enough to read a failure's logs after a weekend. None = keep
+        # until deleted by hand. Only affects Jobs submitted after it is set.
+        "ttl_seconds_after_finished": 259200,   # 3 days
     },
 
     "resources": {

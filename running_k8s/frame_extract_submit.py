@@ -18,6 +18,7 @@ from datetime import datetime
 
 from bb_hpc import settings
 from bb_hpc.src.generate import generate_jobs_frame_extract
+from bb_hpc.running_k8s.k8s_utils import job_ttl_spec
 import re
 
 
@@ -108,6 +109,7 @@ python -u {runner_path} "$fl"
         },
         "spec": {
             "backoffLimit": int(k["job"].get("backoff_limit", 1)),
+            **job_ttl_spec(),
             "completions": int(completions),
             "parallelism": int(min(max(1, parallelism), max(1, completions))),
             "completionMode": "Indexed",

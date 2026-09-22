@@ -5,7 +5,7 @@ from datetime import datetime, timezone, timedelta
 
 from bb_hpc import settings
 from bb_hpc.src.generate import generate_jobs_rpi_detect
-from bb_hpc.running_k8s.k8s_utils import resolve_workers, apply_workers_env
+from bb_hpc.running_k8s.k8s_utils import resolve_workers, apply_workers_env, job_ttl_spec
 
 
 def parse_args():
@@ -183,6 +183,7 @@ exit $rc
         },
         "spec": {
             "backoffLimit": int(k["job"].get("backoff_limit", 1)),
+            **job_ttl_spec(),
             "completions": int(completions),
             "parallelism": int(min(max(1, parallelism), max(1, completions))),
             "completionMode": "Indexed",

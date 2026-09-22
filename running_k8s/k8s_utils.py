@@ -38,3 +38,17 @@ def apply_workers_env(env_list: list, var: str, workers: int) -> list:
     out = [e for e in env_list if e.get("name") != var]
     out.append({"name": var, "value": str(workers)})
     return out
+
+
+def job_ttl_spec() -> dict:
+    """
+    Job-spec fragment that makes Kubernetes clean up finished Jobs.
+
+    settings.k8s["job"]["ttl_seconds_after_finished"] = N deletes a Job, with its
+    pods and their logs, N seconds after it completes OR fails. Unset / None keeps
+    finished Jobs until deleted by hand. Only affects Jobs submitted after it is set.
+    """
+    ttl = settings.k8s.get("job", {}).get("ttl_seconds_after_finished")
+    if ttl is None or str(ttl).strip() == "":
+        return {}
+    return {"ttlSecondsAfterFinished": int(ttl)}
