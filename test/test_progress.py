@@ -137,7 +137,10 @@ import pandas as pd  # noqa: E402
 
 from bb_hpc.src import generate as G  # noqa: E402
 from bb_hpc.src import progress as P  # noqa: E402
-from bb_hpc.src.fileinfo import list_video_files_incremental  # noqa: E402
+from bb_hpc.src.fileinfo import (  # noqa: E402
+    list_rpi_files_incremental,
+    list_video_files_incremental,
+)
 
 
 def dt(day, h, m=0):
@@ -681,8 +684,9 @@ def test_video_catalog_reuses_cache_and_detects_new_files(tmp_path, capsys):
     df, days = _rescanned(videodir, cache, capsys, force_recent_days=0)
     assert len(df) == 4 and days == []          # cache reused
 
-    # A new video lands deep inside a cam dir; the DAY dir's own mtime does not
-    # change, so this only works because we compare against the newest FILE mtime.
+    # A new video lands deep inside a cam dir. The DAY dir's own mtime does not
+    # change, so the probe has to look at the CAM dir's mtime (which creating a file
+    # bumps) -- a bare day_dir.stat() would trust the stale cache forever.
     os.utime(videodir / "20260701" / "cam-0", None)
     _mkvid(videodir, "20260701", 0, 10)
     os.utime(videodir / "20260701" / "cam-0" / "cam-0__20260701T091000__20260701T091500.mp4",
@@ -696,6 +700,79 @@ def test_video_catalog_reuses_cache_and_detects_new_files(tmp_path, capsys):
     assert days == ["20260701", "20260702"]     # forced regardless of mtime
 
     assert set(df.columns) == {"file_name", "full_path", "starttime", "endtime", "cam"}
+
+
+# --------------------------------------------------------------------------- #
+# Incremental RPi catalog
+# --------------------------------------------------------------------------- #
+def _mkrpi(piroot, day, cam, minute):
+    d = piroot / day / cam
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{cam}_{day}T09{minute:02d}00.h264").write_text("v")
+
+
+def _rpi_rescanned(piroot, cache, capsys, **kw):
+    df = list_rpi_files_incremental(str(piroot), str(cache), **kw)
+    lines = capsys.readouterr().out.splitlines()
+    days = [lines[i - 1] for i, l in enumerate(lines) if l == "...reindexing RPi day"]
+    return df, days
+
+
+def test_rpi_catalog_reuses_cache_and_detects_new_files(tmp_path, capsys):
+    piroot = tmp_path / "pi"
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    for day in ("20260701", "20260702"):
+        for minute in (0, 5):
+            _mkrpi(piroot, day, "exitcam", minute)
+
+    df, days = _rpi_rescanned(piroot, cache, capsys, force_recent_days=0)
+    assert len(df) == 4 and days == ["20260701", "20260702"]
+
+    df, days = _rpi_rescanned(piroot, cache, capsys, force_recent_days=0)
+    assert len(df) == 4 and days == []          # cache reused
+
+    # A new video in a cam dir bumps that dir's mtime, which is the signal the
+    # probe reads -- the day dir's own mtime is unchanged.
+    _mkrpi(piroot, "20260701", "exitcam", 10)
+
+    df, days = _rpi_rescanned(piroot, cache, capsys, force_recent_days=0)
+    assert days == ["20260701"], days
+    assert len(df) == 5
+
+    df, days = _rpi_rescanned(piroot, cache, capsys, force_recent_days=2)
+    assert days == ["20260701", "20260702"]     # forced regardless of mtime
+
+
+def test_rpi_catalog_backdates_parquet_so_concurrent_writes_are_not_lost(tmp_path, capsys):
+    """
+    A .h264 landing WHILE the day is being scanned must be picked up next run.
+
+    Stamping the parquet with "now" instead would make it newer than the cam dir,
+    masking that video forever -- on a 4h season-wide scan that is a wide window.
+    """
+    piroot = tmp_path / "pi"
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _mkrpi(piroot, "20260701", "exitcam", 0)
+
+    # Park the day's dir mtimes far in the past so "back-dated to the pre-scan
+    # sample" and "stamped now" are ~90M seconds apart and cannot be confused.
+    sampled = 1_700_000_000.0
+    for d in (piroot / "20260701" / "exitcam", piroot / "20260701"):
+        os.utime(d, (sampled, sampled))
+
+    _rpi_rescanned(piroot, cache, capsys, force_recent_days=0)
+
+    out_pq = cache / "daily" / "rpi_20260701.parquet"
+    assert abs(out_pq.stat().st_mtime - sampled) < 1.0, (
+        "parquet must be back-dated to the pre-scan sample, not stamped now")
+
+    # A video that landed during the scan is newer than that sample, so the next
+    # run sees it. Stamping "now" would have masked it forever.
+    _mkrpi(piroot, "20260701", "exitcam", 5)
+    _, days = _rpi_rescanned(piroot, cache, capsys, force_recent_days=0)
+    assert days == ["20260701"], "a video added during the scan must be seen next run"
 
 
 def test_video_catalog_empty_root(tmp_path):

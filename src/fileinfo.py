@@ -81,7 +81,10 @@ def _max_file_mtime_python(day_dir: Path) -> datetime | None:
 def _latest_file_mtime(day_dir: Path) -> datetime | None:
     """
     Return the newest file mtime anywhere under day_dir (recursive).
-    Used for RPi and raw-video daily caches, where files live in per-camera subdirs.
+
+    Exhaustive and exact, but it stats every file, so a season of day dirs costs
+    hours on shared storage. The daily caches use _latest_dir_mtime instead; this is
+    kept as the reference probe for the case where directory mtimes prove too coarse.
     """
     import subprocess, shlex
     try:
@@ -102,6 +105,45 @@ def _latest_file_mtime(day_dir: Path) -> datetime | None:
     except Exception:
         pass
     return _max_file_mtime_python(day_dir)
+
+
+def _latest_dir_mtime(day_dir: Path) -> datetime | None:
+    """
+    Newest mtime among day_dir itself and its immediate subdirectories.
+
+    This is the change detector the daily caches actually need. A video landing in
+    <day>/cam-N/ bumps that camera directory's mtime, so the "this day grew" signal
+    is already visible from ~3 stats per day -- _latest_file_mtime derives the same
+    answer by stat'ing every file, which on shared storage costs minutes per day and
+    is paid for every day of the season on every run, almost always to conclude that
+    nothing changed.
+
+    Only the day dir is scanned, never the camera dirs, so the cost does not grow
+    with the number of videos in a day.
+
+    What it does not see is an in-place rewrite of a file that already exists, which
+    bumps that file's mtime but no directory's. The capture pipeline only appends, and
+    callers pass force_recent_days to rescan the days still being written regardless.
+    """
+    try:
+        newest = day_dir.stat().st_mtime
+    except OSError:
+        return None
+    try:
+        with os.scandir(str(day_dir)) as it:
+            for entry in it:
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    mt = entry.stat(follow_symlinks=False).st_mtime
+                except OSError:
+                    continue
+                if mt > newest:
+                    newest = mt
+    except OSError:
+        pass
+    return datetime.fromtimestamp(newest, tz=timezone.utc)
+
 
 def _safe_subdirs(p: Path):
     try:
@@ -221,10 +263,20 @@ def list_bbb_files_incremental(
         cols.extend(["is_valid", "valid_check"])
     return pd.DataFrame(columns=cols)
 
-def list_rpi_files_incremental(video_root: str, cache_dir: str, video_glob_pattern: str = "*.h264") -> pd.DataFrame:
+def list_rpi_files_incremental(video_root: str, cache_dir: str, video_glob_pattern: str = "*.h264",
+                               force_recent_days: int = 2) -> pd.DataFrame:
     """
     Cache daily catalogs of RPi videos under cache_dir/daily/rpi_YYYYMMDD.parquet.
-    Only rescan a day if the newest file mtime under that day is newer than the cache.
+    Only rescan a day if its directory mtimes are newer than the cache.
+
+    Mirrors list_video_files_incremental, including both of its safeguards:
+
+    - The written daily parquet's mtime is back-dated to the *pre-scan* directory
+      mtime sample, so a video that lands while we are scanning is guaranteed to look
+      newer than the cache and is picked up next run. Without this the parquet is
+      stamped "now", and anything written during the scan is masked forever.
+    - force_recent_days unconditionally rescans the N newest day dirs, which is cheap
+      and covers both coarse mtime granularity and in-place file rewrites.
     """
     daily_dir = Path(cache_dir) / "daily"
     daily_dir.mkdir(parents=True, exist_ok=True)
@@ -236,29 +288,38 @@ def list_rpi_files_incremental(video_root: str, cache_dir: str, video_glob_patte
         if len(name) == 8 and name.replace("-", "").isdigit():
             day_paths.append(d)
 
+    n_force = max(0, int(force_recent_days))
+    forced = {d.name for d in day_paths[len(day_paths) - n_force:]} if n_force else set()
+
     dfs = []
     for d in day_paths:
         day_str = d.name
         out_pq = daily_dir / f"rpi_{day_str.replace('-', '')}.parquet"
 
-        deep_mtime = _latest_file_mtime(d)
-        try:
-            if out_pq.exists():
-                pq_mtime = datetime.fromtimestamp(out_pq.stat().st_mtime, tz=timezone.utc)
-                if deep_mtime is None or pq_mtime >= deep_mtime:
-                    try:
-                        dfs.append(pd.read_parquet(out_pq))
-                        continue
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+        # Sample the day's directory mtimes BEFORE scanning it.
+        deep_mtime = _latest_dir_mtime(d)
+
+        if day_str not in forced:
+            try:
+                if out_pq.exists():
+                    pq_mtime = datetime.fromtimestamp(out_pq.stat().st_mtime, tz=timezone.utc)
+                    if deep_mtime is None or pq_mtime >= deep_mtime:
+                        try:
+                            dfs.append(pd.read_parquet(out_pq))
+                            continue
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
         print(day_str)
         print("...reindexing RPi day")
         df_day = _list_rpi_day(d, day_str, video_glob_pattern)
         try:
             df_day.to_parquet(out_pq, index=False)
+            if deep_mtime is not None:
+                ts = deep_mtime.timestamp()
+                os.utime(out_pq, (ts, ts))
         except Exception:
             pass
         dfs.append(df_day)
@@ -306,12 +367,12 @@ def list_video_files_incremental(
 ) -> pd.DataFrame:
     """
     Cache daily catalogs of raw videos under cache_dir/daily/video_YYYYMMDD.parquet.
-    Only rescan a day if the newest file mtime under that day is newer than the cache.
+    Only rescan a day if its directory mtimes are newer than the cache.
 
-    Mirrors list_rpi_files_incremental, with two additions:
+    Mirrors list_rpi_files_incremental, including both of its safeguards:
 
     - The written daily parquet's mtime is back-dated to the *pre-scan* sample of
-      the day's newest file mtime. Both timestamps then come from the same
+      the day's directory mtimes. Both timestamps then come from the same
       (shared-storage) clock, and any video that lands *during* our os.walk is
       guaranteed to be newer than the cache -- so it is picked up on the next run
       instead of being silently lost. Without this, a file written between the
@@ -335,8 +396,8 @@ def list_video_files_incremental(
     for d in day_paths:
         out_pq = daily_dir / f"video_{_day_key(d.name)}.parquet"
 
-        # Sample the day's newest file mtime BEFORE scanning it.
-        deep_mtime = _latest_file_mtime(d)
+        # Sample the day's directory mtimes BEFORE scanning it.
+        deep_mtime = _latest_dir_mtime(d)
 
         if d.name not in forced:
             try:
