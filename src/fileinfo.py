@@ -729,6 +729,33 @@ def is_bbb_file_valid_globfilematch(bbb_file):
             return False
     return False  # Return False if no valid matching file is found
 
+def _run_isolated_capnp_check(script: str, timeout: int = 60) -> bool:
+    """
+    Run a capnp read in a child process; True only if the child exits 0.
+
+    Cap'n Proto reports a malformed file by throwing a C++ kj::Exception, which
+    calls terminate() and aborts the process -- it is NOT a Python exception, so
+    `except Exception` around FrameContainer.read() does not catch it. Any read of
+    an untrusted .bbb therefore has to happen somewhere its death is survivable.
+
+    A child killed by SIGABRT returns a negative returncode, which reads as
+    "invalid" here instead of taking the caller down. That matters most under
+    multiprocessing: a pool worker that aborts mid-task never returns its result,
+    and the parent then waits for it forever.
+    """
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            timeout=timeout,
+            capture_output=True,
+        )
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+    except Exception:
+        return False
+
+
 def is_bbb_file_valid_basicmatch(bbb_file, check_read_file = False):
     """
     Checks if a .bbb file is valid by attempting to open and read it.
@@ -757,13 +784,20 @@ def is_bbb_file_valid_basicmatch(bbb_file, check_read_file = False):
                     return False
             except Exception:
                 pass
-            # Attempt to open and read the file
-            try:
-                with open(bbb_file, 'rb') as f:
-                    bbb.FrameContainer.read(f)
-                return True  # File is valid
-            except Exception:
-                return False  # File is invalid or cannot be read
+            # Reading the capnp framing aborts the process on a truncated file, so
+            # it goes in a child (see _run_isolated_capnp_check).
+            script = f'''
+import sys
+import bb_binary
+bbb = bb_binary.common.bbb
+try:
+    with open({bbb_file!r}, "rb") as f:
+        bbb.FrameContainer.read(f)
+except Exception:
+    sys.exit(1)
+sys.exit(0)
+'''
+            return _run_isolated_capnp_check(script)
 
 
 def is_bbb_file_valid_deep(bbb_file):
@@ -815,24 +849,19 @@ try:
                         sys.exit(1)  # invalid
                 sys.exit(0)  # valid
             except Exception:
-                if size is not None:
-                    if f.tell() >= size:
-                        sys.exit(0)  # valid
+                # Compare against pos (where this read STARTED), not f.tell().
+                # A failed read leaves the handle wherever capnp stopped, which for
+                # a truncated file is EOF -- so f.tell() >= size was treating "blew
+                # up trying to read past the end" as "ended cleanly", and every
+                # truncated .bbb passed. Being at EOF *before* attempting a read is
+                # the only clean end, and the top of the loop already handles it.
+                if size is not None and pos >= size:
+                    sys.exit(0)  # valid: nothing was left to read
                 sys.exit(1)  # invalid
 except Exception:
     sys.exit(1)  # invalid
 '''
-    try:
-        result = subprocess.run(
-            [sys.executable, "-c", script],
-            timeout=60,
-            capture_output=True,
-        )
-        return result.returncode == 0
-    except subprocess.TimeoutExpired:
-        return False
-    except Exception:
-        return False
+    return _run_isolated_capnp_check(script)
 
 
 def is_dill_file_valid(dill_file):

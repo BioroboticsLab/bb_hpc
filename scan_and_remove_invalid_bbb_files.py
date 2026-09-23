@@ -14,7 +14,8 @@ import os
 import shlex
 import subprocess
 import sys
-from multiprocessing import Pool
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 
 from bb_hpc import settings
 from bb_hpc.src.fileinfo import is_bbb_file_valid_basicmatch, is_bbb_file_valid_deep
@@ -81,14 +82,30 @@ def _scan_day(
     invalid: list[str] = []
 
     if num_workers > 1 and len(files) > 1:
-        # Parallel validation
+        # Parallel validation.
+        #
+        # ProcessPoolExecutor, not multiprocessing.Pool: the validators read capnp
+        # data, and a malformed .bbb aborts the reading process outright. Pool does
+        # not notice a dead worker -- imap_unordered just waits for a result that is
+        # never coming, so the scan hangs silently on exactly the corrupt files it
+        # exists to find. ProcessPoolExecutor raises BrokenProcessPool instead.
+        #
+        # The validators isolate their own capnp reads now, so this should not
+        # trigger; it is the backstop for anything that still kills a worker.
         work_items = [(path, deep_check_bbb) for path in files]
-        with Pool(processes=num_workers) as pool:
-            for path, ok in pool.imap_unordered(_validate_file, work_items, chunksize=10):
-                if not ok:
-                    invalid.append(path)
-                    if verbose:
-                        print(f"[invalid] {path}")
+        try:
+            with ProcessPoolExecutor(max_workers=num_workers) as ex:
+                for path, ok in ex.map(_validate_file, work_items, chunksize=10):
+                    if not ok:
+                        invalid.append(path)
+                        if verbose:
+                            print(f"[invalid] {path}")
+        except BrokenProcessPool as e:
+            raise RuntimeError(
+                f"a validation worker died while scanning {day_dir} ({e}). "
+                f"The scan is incomplete, so nothing was removed for this day. "
+                f"Re-run with --num-workers 1 to find the file that killed it."
+            ) from e
     else:
         # Sequential validation
         for path in files:
@@ -147,6 +164,7 @@ def main():
     total_files = 0
     total_invalid = 0
     total_removed = 0
+    failed_days: list[str] = []
 
     for d in dates:
         day_dir = os.path.join(pipeline_root, d[:4], d[4:6], d[6:8])
@@ -154,9 +172,16 @@ def main():
             print(f"[skip] missing day directory: {day_dir}")
             continue
         print(f"[scan] {day_dir}")
-        n_files, n_invalid, n_removed, invalid_paths = _scan_day(
-            day_dir, args.dry_run, args.verbose, args.deep_check_bbb, args.num_workers
-        )
+        try:
+            n_files, n_invalid, n_removed, invalid_paths = _scan_day(
+                day_dir, args.dry_run, args.verbose, args.deep_check_bbb, args.num_workers
+            )
+        except RuntimeError as e:
+            # A partial invalid-list must not reach the removal step, and the day
+            # must not be reported as clean, so skip it and fail at the end.
+            print(f"[error] {e}", file=sys.stderr)
+            failed_days.append(d)
+            continue
         total_files += n_files
         total_invalid += n_invalid
         total_removed += n_removed
@@ -173,6 +198,11 @@ def main():
         print(f"[total] files={total_files} invalid={total_invalid} (dry-run)")
     else:
         print(f"[total] files={total_files} invalid={total_invalid} removed={total_removed}")
+
+    if failed_days:
+        print(f"[error] {len(failed_days)} day(s) did not finish scanning: "
+              f"{', '.join(failed_days)}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
