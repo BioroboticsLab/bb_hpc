@@ -33,6 +33,13 @@ def parse_args():
     p.add_argument("--window-tz", default=None,
                    help="Override background_window_tz: anchor windows at local midnight in this "
                         "zone, e.g. Europe/Berlin (default: settings, else UTC).")
+    p.add_argument("--frame-interval", type=int, default=None,
+                   help="Override frame_interval_sec: keep at most one extracted frame per N "
+                        "seconds (e.g. 60 for one per minute). Frames are extracted every "
+                        "interval_in_sec, so this subsamples them -- the knob that keeps a long "
+                        "window's frame count, and its memory, down to what a short one uses. "
+                        "0 or unset means every extracted frame. Changes the config tag, so each "
+                        "value is its own comparable product.")
     p.add_argument("--dry-run", action="store_true",
                    help="Write filelists & Job spec, but do not kubectl apply.")
     args = p.parse_args()
@@ -137,6 +144,8 @@ def main():
     if args.window is not None:
         window = int(args.window) if args.window.isdigit() else args.window
     window_tz = args.window_tz if args.window_tz is not None else s.get("background_window_tz", None)
+    frame_interval_sec = (args.frame_interval if args.frame_interval is not None
+                          else s.get("frame_interval_sec", None))
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     filelist_dir_host = Path(settings.jobdir_local) / "k8s" / "background" / stamp
     filelist_dir_pod = Path(settings.jobdir_hpc) / "k8s" / "background" / stamp
@@ -145,7 +154,7 @@ def main():
         frames_root_dir      = str(Path(settings.frames_dir_local)),
         backgrounds_root_dir = str(Path(settings.backgrounds_dir_local)),
         datestring           = args.dates,
-        frame_interval_sec   = s.get("frame_interval_sec", None),
+        frame_interval_sec   = frame_interval_sec,
         background_window    = window,
         window_size          = int(s.get("window_size", 10)),
         num_median_images    = int(s.get("num_median_images", 200)),
