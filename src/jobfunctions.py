@@ -402,7 +402,6 @@ def job_for_save_detect_chunk(job_args_list):
         from bb_utils.ids import BeesbookID
         from enum import Enum
         from bb_binary.parsing import get_video_fname
-        import capnp
 
     
         # Important variables
@@ -415,11 +414,25 @@ def job_for_save_detect_chunk(job_args_list):
         # BeeOnGlass = 'BeeOnGlass'  ## 3
         # BeeInCell = 'BeeInCell'   ## 4  
     
+        DETECTION_COLUMNS = ['timestamp', 'cam_id', 'detection_type', 'x_pixels', 'y_pixels',
+                             'orientation_pixels', 'localizer_saliency', 'bee_id', 'bee_id_confidence']
+
         # Define subfunction to get detections from bb_binary
         def get_detections_from_bb_binary(repository_path, dt_begin, dt_end,
                                           only_tagged_bees=False, cam_id=None,
                                           is_2019_repos=True):
+            """
+            Return (DataFrame of detections, number of frames read).
+
+            iterate_bb_binary_repository is a plain generator: once it raises, it is
+            dead and the next next() is StopIteration. An error therefore cannot be
+            skipped per frame -- catching it and continuing used to end the hour
+            quietly, and the partial (or empty) result was saved as if complete, which
+            the submitters then count as done forever. Any read error is fatal for the
+            window instead.
+            """
             detections_list = []
+            n_frames = 0
             # Use the iterator to get detections from the repository
             iterator = iterate_bb_binary_repository(
                 repository_path, dt_begin, dt_end,
@@ -427,69 +440,44 @@ def job_for_save_detect_chunk(job_args_list):
                 cam_id=cam_id,
                 is_2019_repos=is_2019_repos
             )
-            while True:
-                try:
-                    cam_id_iter, frame_id, frame_datetime, frame_detections, frame_kdtree = next(iterator)
-                except StopIteration:
-                    break
-                except ValueError as e:
-                    # cKDTree construction failed for this frame—skip it
-                    print(f"Skipping frame - (bad KD-tree): {e}")
-                    continue     
-                except capnp.KjException as e:
-                    # Cap'n Proto Premature EOF — skip & log everything we know
-                    # If you have a variable holding the .bb file path (e.g. fc_path), include that too:
-                    print('capnp KJException')
-                    # print(
-                    #     f"[capnp EOF] frame={frame_id!r}, time={frame_datetime!r}, "
-                    #     f"file={locals().get('fc_path','<unknown>')}: {type(e).__name__}: {e!r}"
-                    # )
-                    continue
-            
-                # (optional) catch any other unexpected errors, so your loop never dies
-                except Exception as e:
-                    print(
-                        f"[unexpected error {type(e).__name__}] frame={frame_id!r}, "
-                        f"time={frame_datetime!r}, file={locals().get('fc_path','<unknown>')}: {e!r}"
-                    )
-                    continue                    
-            # for cam_id_iter, frame_id, frame_datetime, frame_detections, frame_kdtree in iterator:
-                for det in frame_detections:
-                    # Extract detection fields
-                    detection_type = det.detection_type.value  # this will be an integer
-                    x_pixels = det.x_pixels
-                    y_pixels = det.y_pixels
-                    orientation_pixels = det.orientation_pixels
-                    timestamp = det.timestamp
-                    detection_index = det.detection_index
-                    # For tagged bees, get bee_id and confidence
-                    if detection_type == 1:
-                        # Convert bit probabilities to bits (0 or 1)
-                        bits = (np.array(det.bit_probabilities) > 0.5).astype(int)
-                        # Create a BeesbookID from bits
-                        bb_id = BeesbookID.from_bb_binary(bits)
-                        # Convert to integer ID
-                        bee_id = bb_id.as_ferwar()
-                        # Calculate confidence (product of probabilities)
-                        bit_probs = np.array(det.bit_probabilities)   
-                        # this confidence calculation is the same as bb_tracking -> track_generator -> calculate_tracked_bee_id
-                        bee_id_confidence = np.prod(np.abs(bit_probs - 0.5) * 2.0)
-                    else:
-                        bee_id = None
-                        bee_id_confidence = None
-                    detections_list.append({
-                        'timestamp':          det.timestamp,
-                        'cam_id':             cam_id_iter,
-                        'detection_type':     det.detection_type.value,
-                        'x_pixels':           det.x_pixels,
-                        'y_pixels':           det.y_pixels,
-                        'orientation_pixels': det.orientation_pixels,
-                        'localizer_saliency':  det.localizer_saliency, 
-                        'bee_id':             bee_id,
-                        'bee_id_confidence':  bee_id_confidence
-                    })
+            try:
+                for cam_id_iter, frame_id, frame_datetime, frame_detections, frame_kdtree in iterator:
+                    n_frames += 1
+                    for det in frame_detections:
+                        detection_type = det.detection_type.value  # this will be an integer
+                        # For tagged bees, get bee_id and confidence
+                        if detection_type == 1:
+                            # Convert bit probabilities to bits (0 or 1)
+                            bits = (np.array(det.bit_probabilities) > 0.5).astype(int)
+                            # Create a BeesbookID from bits, and convert to integer ID
+                            bee_id = BeesbookID.from_bb_binary(bits).as_ferwar()
+                            # Calculate confidence (product of probabilities)
+                            bit_probs = np.array(det.bit_probabilities)
+                            # this confidence calculation is the same as bb_tracking -> track_generator -> calculate_tracked_bee_id
+                            bee_id_confidence = np.prod(np.abs(bit_probs - 0.5) * 2.0)
+                        else:
+                            bee_id = None
+                            bee_id_confidence = None
+                        detections_list.append({
+                            'timestamp':          det.timestamp,
+                            'cam_id':             cam_id_iter,
+                            'detection_type':     detection_type,
+                            'x_pixels':           det.x_pixels,
+                            'y_pixels':           det.y_pixels,
+                            'orientation_pixels': det.orientation_pixels,
+                            'localizer_saliency': det.localizer_saliency,
+                            'bee_id':             bee_id,
+                            'bee_id_confidence':  bee_id_confidence
+                        })
+            except MemoryError:
+                raise
+            except Exception as e:
+                raise RuntimeError(
+                    f"bb_binary read failed cam={cam_id} {dt_begin} -> {dt_end} after "
+                    f"{n_frames} frames: {type(e).__name__}: {e}"
+                ) from e
             # Create a DataFrame from the list of detections
-            return pd.DataFrame(detections_list)
+            return pd.DataFrame(detections_list), n_frames
     
         # Define subfunction to convert detections to df_untagged format
         def convert_detections_to_df_untagged(detections_df):
@@ -519,31 +507,92 @@ def job_for_save_detect_chunk(job_args_list):
             to_dt = datetime.strptime(to_dt, '%Y-%m-%d %H:%M:%S').replace(tzinfo=pytz.UTC)
         else:
             to_dt = to_dt.astimezone(pytz.UTC)
-    
-        # Get detections from bb_binary
-        detections_df = get_detections_from_bb_binary(
-            repository_path=repo_path,
-            dt_begin=from_dt,
-            dt_end=to_dt,
-            only_tagged_bees=False,
-            cam_id=cam_id,
-            is_2019_repos=True
-        )
-    
-        if len(detections_df)>0:
+
+        # A repo root that is missing or has no year dirs (e.g. the share is not
+        # mounted in the pod) reads as zero frames without any error. Refuse it
+        # rather than save an empty hour.
+        if not os.path.isdir(repo_path) or not any(d.isdigit() for d in os.listdir(repo_path)):
+            raise RuntimeError(f"bb_binary repo root missing or has no year dirs: {repo_path}")
+
+        # ---- Empty-frame patch for scipy.cKDTree (same as tracking) ----
+        # Older bb_tracking builds call cKDTree(xy) unconditionally, which raises on a
+        # frame with zero detections (lid event, obscured hive) and, now that read
+        # errors are fatal, would fail the whole hour. Restored in the finally below.
+        import scipy.spatial as _sp_spatial
+        _orig_ckdtree = _sp_spatial.cKDTree
+        def _ckdtree_empty_safe(data, *a, **kw):
+            try:
+                n = len(data)
+            except TypeError:
+                n = -1
+            if n == 0:
+                return _orig_ckdtree(np.empty((0, 2)), *a, **kw)
+            return _orig_ckdtree(data, *a, **kw)
+        _sp_spatial.cKDTree = _ckdtree_empty_safe
+
+        try:
+            # Get detections from bb_binary
+            detections_df, n_frames = get_detections_from_bb_binary(
+                repository_path=repo_path,
+                dt_begin=from_dt,
+                dt_end=to_dt,
+                only_tagged_bees=False,
+                cam_id=cam_id,
+                is_2019_repos=True
+            )
+        finally:
+            _sp_spatial.cKDTree = _orig_ckdtree
+
+        if len(detections_df) > 0:
             # Convert detections to df_untagged format
             df_untagged = convert_detections_to_df_untagged(detections_df)
         else:
-            df_untagged = pd.DataFrame()
-    
+            # A clean read with no detections (or no frames inside the window) is a
+            # real empty hour. Keep the column schema, so it is distinguishable from
+            # the column-less stubs the old error handling wrote.
+            print(f"[save_detect] cam={cam_id} {from_dt} -> {to_dt}: {n_frames} frames, "
+                  f"0 detections; writing an empty file with schema", flush=True)
+            df_untagged = pd.DataFrame({c: pd.Series(dtype='float64') for c in DETECTION_COLUMNS})
+            df_untagged['timestamp'] = pd.Series(dtype='datetime64[ns, UTC]')
+
         # Generate the output filename using the same method as bb_binary
         output_filename = os.path.join(save_path, get_video_fname(cam_id, from_dt, to_dt) + '.parquet')
-    
-        # Save to Parquet file
-        df_untagged.to_parquet(output_filename)
-    
-    for kwargs in job_args_list:
-        save_all_detections(**kwargs)
+
+        # Write to a temp name and rename, so a killed pod never leaves a partial file
+        # under the final name. '.parquet.tmp' does not match the '*.parquet' globs of
+        # build_outinfo or downstream readers.
+        tmp_filename = output_filename + '.tmp'
+        try:
+            df_untagged.to_parquet(tmp_filename)
+            os.replace(tmp_filename, output_filename)
+        except BaseException:
+            try:
+                os.remove(tmp_filename)
+            except OSError:
+                pass
+            raise
+        print(f"[save_detect] cam={cam_id} {from_dt} -> {to_dt}: {n_frames} frames, "
+              f"{len(df_untagged)} detections -> {output_filename}", flush=True)
+
+    total = len(job_args_list)
+    failures = 0
+    for i, kw in enumerate(job_args_list, 1):
+        try:
+            save_all_detections(**kw)
+        except MemoryError:
+            raise
+        except Exception as e:
+            # Contain it so one bad hour does not abort the remaining windows in this
+            # chunk. Nothing was written for the failed window, so it stays 'missing'
+            # (or 'stale') and the next submit schedules it again.
+            failures += 1
+            import traceback; traceback.print_exc()
+            print(f"[save_detect_chunk] window {i}/{total} FAILED cam={kw.get('cam_id')} "
+                  f"{kw.get('from_dt')} -> {kw.get('to_dt')}: {e}", flush=True)
+    print(f"[save_detect_chunk] done: {total - failures}/{total} ok, {failures} failed", flush=True)
+    if failures:
+        import sys
+        sys.exit(1)
     return True
 
 #################################################################
