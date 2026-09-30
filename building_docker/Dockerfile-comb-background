@@ -16,6 +16,12 @@ RUN apt-get update && \
       git ffmpeg wget ca-certificates bzip2 && \
     rm -rf /var/lib/apt/lists/*
 
+# The NGC base image ships pip config that adds https://pypi.ngc.nvidia.com as an extra index.
+# That host no longer resolves, so every pip call retries against it and eventually fails.
+# Ignore all pip config files and use PyPI only.
+ENV PIP_CONFIG_FILE=/dev/null \
+    PIP_INDEX_URL=https://pypi.org/simple
+
 # Download & install Miniforge3 (conda-forge’s lightweight installer)
 RUN wget --quiet \
       https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh \
@@ -60,6 +66,12 @@ ARG CELLSEG_REPO_REF=bbhpc-integration
 # below sm_75, so a 1080 Ti hits "no kernel image available". Use cu126 only for
 # Blackwell-only nodes (sm_100/sm_120).
 ARG TORCH_CUDA=cu118
+# Torch version to pin. Blackwell (sm_120, e.g. RTX 5080) needs torch>=2.7 on cu128:
+#   --build-arg TORCH_CUDA=cu128 --build-arg TORCH_VERSION=2.8.0 \
+#   --build-arg TORCHVISION_VERSION=0.23.0 --build-arg TORCHAUDIO_VERSION=2.8.0
+ARG TORCH_VERSION=2.5.1
+ARG TORCHVISION_VERSION=0.20.1
+ARG TORCHAUDIO_VERSION=2.5.1
 # Cache-bust: this file's content is the branch head commit, so the clone layer
 # below is rebuilt whenever the branch moves (otherwise `docker build` reuses a
 # stale clone and the build-time check below fails on missing features).
@@ -71,7 +83,9 @@ RUN set -euo pipefail && \
     # Ensure CUDA-enabled Torch in this env (segmentation-models-pytorch / MONAI).
     # Pinned so the GPU arch coverage is predictable (see TORCH_CUDA above).
     python -m pip install --index-url "https://download.pytorch.org/whl/${TORCH_CUDA}" \
-        torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1
+        torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION} && \
+    # cupy for the GPU rolling median: >=13.4 carries Blackwell (sm_100/sm_120) kernels.
+    python -m pip install --no-cache-dir --upgrade "cupy-cuda12x>=13.4.1,<14.0.0"
 
 # Build-time sanity check: torch imports and the bb_hpc-facing API is present
 # (cams=/dates= prove we built the bbhpc-integration branch; window_tz proves it
