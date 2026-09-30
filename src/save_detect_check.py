@@ -10,13 +10,20 @@ opens each 'done' output's parquet footer and compares it with the .bbb catalog.
 
 Statuses, one per (cam_id, window) unit that has .bbb data in the latest catalog:
 
-    ok          output exists, is newer than its .bbb, and covers them
-    empty_hour  0 rows WITH the column schema: a clean read that found no detections
-    empty_stub  0 rows and NO columns: written by the old error handling   -> redo
-    truncated   last detection ends > tail_tol_min before the .bbb coverage -> redo
-    unreadable  the parquet footer cannot be read                           -> redo
-    missing     no output; the submitter schedules it by itself
-    stale       output older than its newest .bbb; the submitter schedules it by itself
+    ok             output exists, is newer than its .bbb, and covers them
+    ok_empty_tail  last detection ends early, but the .bbb frames after it have no
+                   detections either (camera dark or covered, empty hive): complete
+    empty_hour     0 rows WITH the column schema: a clean read that found no detections
+    empty_stub     0 rows and NO columns: written by the old error handling        -> redo
+    truncated      the .bbb frames after the last detection DO have detections      -> redo
+    unreadable     the parquet footer cannot be read                                -> redo
+    missing        no output; the submitter schedules it by itself
+    stale          output older than its newest .bbb; the submitter schedules it by itself
+
+A parquet has no row for a frame without detections, so "the last detection is
+early" alone does not mean the file is cut short. Outputs whose last detection is
+more than tail_tol_min before the end of the .bbb coverage are therefore checked
+against the .bbb frames after that detection (verify_bbb, on by default).
 
 The three 'redo' statuses must be moved aside before resubmitting, since the
 submitter skips them as done. Read-only: nothing here moves, deletes or submits.
@@ -38,8 +45,13 @@ FLAG_STATUSES = ("empty_stub", "truncated", "unreadable")
 REDO_STATUSES = FLAG_STATUSES + ("missing", "stale")
 
 UNIT_COLUMNS = ["day", "cam_id", "from_dt", "to_dt", "status", "path", "n_rows",
-                "last_detection", "bbb_coverage_end", "tail_gap_min",
+                "last_detection", "bbb_coverage_end", "tail_gap_min", "bbb_dets_after_last",
                 "latest_src_mtime", "out_mtime"]
+
+# Detection timestamps are the frame's float posix time rounded to microseconds, so
+# the frame holding the last detection can compare a hair later than it. Far below
+# one frame interval (>= 1/6 s).
+_FRAME_TOL = pd.Timedelta(milliseconds=10)
 
 
 def bbb_dates(resultdir: str) -> list[str]:
@@ -139,10 +151,33 @@ def read_footer(path: str) -> dict:
         return {"n_rows": None, "n_cols": None, "last_detection": pd.NaT, "error": f"{type(e).__name__}: {e}"}
 
 
+def tail_detections(bbb_paths: Sequence[str], after: pd.Timestamp, until: pd.Timestamp,
+                    loader=None) -> int:
+    """Detections in .bbb frames with after < t < until. Stops at the first frame that has any.
+
+    `bbb_paths` are the catalog's full_path values for the camera, oldest first.
+    """
+    if loader is None:
+        from bb_binary import load_frame_container as loader
+    lo = (after + _FRAME_TOL).timestamp()
+    hi = until.timestamp()
+    for path in bbb_paths:
+        for frame in loader(path).frames:
+            if lo < frame.timestamp < hi:
+                n = len(frame.detectionsDP) + len(frame.detectionsBees)
+                if n:
+                    return n
+    return 0
+
+
 def check_save_detect(resultdir: str, dates: Sequence[str], tail_tol_min: float = 3.0,
                       interval_hours: int = 1, detect_dir: str | None = None,
-                      max_workers: int = 16) -> pd.DataFrame:
-    """Classify every save_detect unit on `dates`. Returns one row per unit (UNIT_COLUMNS)."""
+                      max_workers: int = 16, verify_bbb: bool = True, loader=None) -> pd.DataFrame:
+    """Classify every save_detect unit on `dates`. Returns one row per unit (UNIT_COLUMNS).
+
+    verify_bbb=False skips reading .bbb frames and flags every early-ending output as
+    'truncated' (fast, but sparse or dark hours become false positives).
+    """
     cache_dir = os.path.join(resultdir, "bbb_fileinfo")
     detect_dir = detect_dir or os.path.join(resultdir, "data_alldetections")
 
@@ -187,6 +222,32 @@ def check_save_detect(resultdir: str, dates: Sequence[str], tail_tol_min: float 
             units.at[idx, "status"] = "truncated"
         else:
             units.at[idx, "status"] = "ok"
+
+    # An early last detection is only a truncation if the .bbb has detections after it.
+    units["bbb_dets_after_last"] = pd.Series(dtype="float64")
+    suspects = units.index[units["status"] == "truncated"]
+    if verify_bbb and len(suspects) and "full_path" in df_bbb.columns:
+        # The catalog can list a file twice; read each once.
+        cat = df_bbb.drop_duplicates("full_path")
+
+        def verify(idx):
+            u = units.loc[idx]
+            sel = cat[(cat["cam_id"] == u["cam_id"]) & (cat["endtime"] > u["last_detection"])
+                      & (cat["starttime"] < u["to_dt"])].sort_values("starttime")
+            try:
+                return tail_detections(sel["full_path"].tolist(), u["last_detection"], u["to_dt"], loader)
+            except Exception as e:
+                # Cannot tell; keep it flagged (a fresh save_detect run fails loudly on it).
+                print(f"[check_save_detect] could not read .bbb for cam={u['cam_id']} {u['from_dt']}: "
+                      f"{type(e).__name__}: {e}", flush=True)
+                return None
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            found = list(ex.map(verify, suspects))
+        for idx, n in zip(suspects, found):
+            units.at[idx, "bbb_dets_after_last"] = n
+            if n == 0:
+                units.at[idx, "status"] = "ok_empty_tail"
 
     units["tail_gap_min"] = ((units["bbb_coverage_end"] - units["last_detection"]).dt.total_seconds() / 60).round(1)
     units["day"] = units["from_dt"].dt.strftime("%Y%m%d")

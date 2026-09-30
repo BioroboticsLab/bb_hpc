@@ -57,8 +57,11 @@ def parse_args():
     sel.add_argument("--since", default=None, help="Earliest YYYYMMDD (inclusive).")
     sel.add_argument("--until", default=None, help="Latest YYYYMMDD (inclusive).")
     p.add_argument("--tail-tol-min", type=float, default=3.0,
-                   help="Flag an output as truncated when its last detection is more than this "
-                        "many minutes before the end of the .bbb coverage of its window.")
+                   help="Check an output against its .bbb frames when its last detection is more than "
+                        "this many minutes before the end of the .bbb coverage of its window.")
+    p.add_argument("--no-verify-bbb", action="store_true",
+                   help="Do not read .bbb frames after the last detection; flag every early-ending "
+                        "output as truncated (fast, but sparse or dark hours become false positives).")
     p.add_argument("--interval-hours", type=int, default=1,
                    help="Window size (must match the submitters).")
     p.add_argument("--backend", choices=list(BACKENDS), default="k8s",
@@ -90,13 +93,17 @@ def main():
 
     print(f"[check_save_detect] {resultdir}: {len(dates)} dates {dates[0]}..{dates[-1]}", flush=True)
     units = check_save_detect(resultdir, dates, tail_tol_min=args.tail_tol_min,
-                              interval_hours=args.interval_hours, max_workers=args.workers)
+                              interval_hours=args.interval_hours, max_workers=args.workers,
+                              verify_bbb=not args.no_verify_bbb)
     if units.empty:
         print("No save_detect units: the .bbb catalog has nothing on these dates.")
         return
 
     print("\nUnits by status (one unit = one camera-hour that has .bbb data):")
     print(units["status"].value_counts().to_string())
+    if (units["status"] == "ok_empty_tail").any():
+        print("(ok_empty_tail: detections end early, but the .bbb frames after them are empty too, "
+              "e.g. camera dark or covered. Complete; nothing to redo.)")
 
     t = by_day(units)
     if not t.empty:
@@ -107,7 +114,8 @@ def main():
     if len(flagged):
         print(f"\n{len(flagged)} output(s) are counted as done by the submitter but must be redone "
               "(move them aside first):")
-        cols = ["cam_id", "from_dt", "status", "n_rows", "last_detection", "bbb_coverage_end", "tail_gap_min"]
+        cols = ["cam_id", "from_dt", "status", "n_rows", "last_detection", "bbb_coverage_end",
+                "tail_gap_min", "bbb_dets_after_last"]
         print(flagged[cols].to_string(index=False, max_rows=40))
 
     out_dir = args.out_dir or os.path.join(resultdir, "bbb_fileinfo", "save_detect_check")

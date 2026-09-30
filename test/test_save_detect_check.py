@@ -97,7 +97,7 @@ def test_bbb_coverage_end_clips_to_window_and_spans_the_boundary():
 
 def test_every_status_is_classified(tmp_path):
     resultdir, paths = _seed(tmp_path)
-    units = C.check_save_detect(resultdir, ["20260701"], tail_tol_min=3)
+    units = C.check_save_detect(resultdir, ["20260701"], tail_tol_min=3, verify_bbb=False)
     got = {(int(r.cam_id), r.from_dt.hour): r.status for r in units.itertuples()}
     assert got == {
         (0, 9): "ok", (1, 9): "empty_stub",
@@ -117,7 +117,7 @@ def test_truncation_tolerance(tmp_path):
 
 def test_fix_commands_move_flagged_then_resubmit(tmp_path):
     resultdir, paths = _seed(tmp_path)
-    units = C.check_save_detect(resultdir, ["20260701"])
+    units = C.check_save_detect(resultdir, ["20260701"], verify_bbb=False)
     out_dir = str(tmp_path / "out")
     cmds = C.fix_commands(units, resultdir, out_dir, backend="k8s", today="20260929")
     text = "\n".join(cmds)
@@ -132,6 +132,79 @@ def test_fix_commands_move_flagged_then_resubmit(tmp_path):
     flagged = open(os.path.join(out_dir, "flagged_files.txt")).read().split()
     assert sorted(flagged) == sorted([paths["empty_stub"], paths["truncated"], paths["unreadable"]])
     assert open(os.path.join(out_dir, "redo_dates.txt")).read().split() == ["20260701"]
+
+
+# --------------------------------------------------------------------------- #
+# Early-ending outputs are verified against the .bbb frames after the last detection
+# --------------------------------------------------------------------------- #
+def _frame(ts, n_dets):
+    return types.SimpleNamespace(timestamp=ts.timestamp(), detectionsDP=[], detectionsBees=[object()] * n_dets)
+
+
+def _loader_for(frames_by_path, calls=None):
+    def load(path):
+        if calls is not None:
+            calls.append(path)
+        return types.SimpleNamespace(frames=frames_by_path.get(path, []))
+    return load
+
+
+def _truncated_bbb_path():
+    # _seed: cam 1, hour 10 has one .bbb 10:00-10:30 and a parquet ending at 10:05
+    return f"/repo/{_gvf(1, dt(1, 10), dt(1, 10, 30))}.bbb"
+
+
+def test_early_end_with_empty_bbb_frames_after_is_complete(tmp_path):
+    """Berlin 2026-05 / 07-29: detections stop but the camera keeps recording empty
+    (dark / covered / beeless) frames. A parquet has no row for such frames."""
+    resultdir, paths = _seed(tmp_path)
+    frames = [_frame(dt(1, 10, m), 0) for m in range(6, 30)]
+    units = C.check_save_detect(resultdir, ["20260701"], loader=_loader_for({_truncated_bbb_path(): frames}))
+    row = units[(units["cam_id"] == 1) & (units["from_dt"].dt.hour == 10)].iloc[0]
+    assert row["status"] == "ok_empty_tail"
+    assert row["bbb_dets_after_last"] == 0
+    assert paths["truncated"] not in set(units.loc[units["status"].isin(C.FLAG_STATUSES), "path"])
+
+
+def test_early_end_with_detections_after_is_truncated(tmp_path):
+    resultdir, _ = _seed(tmp_path)
+    frames = [_frame(dt(1, 10, 6), 0), _frame(dt(1, 10, 7), 42)]
+    units = C.check_save_detect(resultdir, ["20260701"], loader=_loader_for({_truncated_bbb_path(): frames}))
+    row = units[(units["cam_id"] == 1) & (units["from_dt"].dt.hour == 10)].iloc[0]
+    assert row["status"] == "truncated"
+    assert row["bbb_dets_after_last"] == 42
+
+
+def test_the_last_detections_own_frame_is_not_counted_as_after(tmp_path):
+    """The parquet stores the frame time rounded to microseconds, so the float frame
+    time of that same frame can compare slightly later."""
+    resultdir, _ = _seed(tmp_path)
+    same_frame = types.SimpleNamespace(timestamp=dt(1, 10, 5).timestamp() + 4e-7,
+                                       detectionsDP=[], detectionsBees=[object()] * 564)
+    units = C.check_save_detect(resultdir, ["20260701"], loader=_loader_for({_truncated_bbb_path(): [same_frame]}))
+    row = units[(units["cam_id"] == 1) & (units["from_dt"].dt.hour == 10)].iloc[0]
+    assert row["status"] == "ok_empty_tail"
+
+
+def test_a_file_listed_twice_in_the_catalog_is_read_once(tmp_path):
+    resultdir, _ = _seed(tmp_path)
+    cat_path = os.path.join(resultdir, "bbb_fileinfo", "bbb_info_20260701.parquet")
+    cat = pd.read_parquet(cat_path)
+    pd.concat([cat, cat[cat["full_path"] == _truncated_bbb_path()]]).to_parquet(cat_path, index=False)
+    calls = []
+    C.check_save_detect(resultdir, ["20260701"], loader=_loader_for({}, calls))
+    assert calls == [_truncated_bbb_path()]
+
+
+def test_unreadable_bbb_keeps_the_output_flagged(tmp_path):
+    resultdir, _ = _seed(tmp_path)
+
+    def broken(path):
+        raise OSError("simulated read error")
+
+    units = C.check_save_detect(resultdir, ["20260701"], loader=broken)
+    row = units[(units["cam_id"] == 1) & (units["from_dt"].dt.hour == 10)].iloc[0]
+    assert row["status"] == "truncated"
 
 
 def test_all_ok_means_no_commands(tmp_path):
