@@ -62,15 +62,25 @@ open(os.path.join(day, "zero.bbb"), "wb").close()
 _CHECK = '''
 import json, os, sys
 sys.path.insert(0, {parent!r})
-from bb_hpc.src.fileinfo import is_bbb_file_valid_basicmatch, is_bbb_file_valid_deep
+from bb_hpc.src.fileinfo import (
+    BbbCheckInconclusive,
+    is_bbb_file_valid_basicmatch,
+    is_bbb_file_valid_deep,
+    is_bbb_file_valid_frames,
+)
 
 day = {day!r}
 out = {{}}
 for name in ("v1", "v3", "cut", "hdr", "zero"):
     p = os.path.join(day, name + ".bbb")
+    try:
+        frames = is_bbb_file_valid_frames(p)
+    except BbbCheckInconclusive:
+        frames = "inconclusive"
     out[name] = {{
         "basic": is_bbb_file_valid_basicmatch(p, check_read_file=True),
         "deep": is_bbb_file_valid_deep(p),
+        "frames": frames,
     }}
 print(json.dumps(out))
 '''
@@ -121,6 +131,30 @@ def test_basic_check_is_shallow_by_design(verdicts):
     """basicmatch reads only the first container, so a later cut is deep's job."""
     assert verdicts["cut"]["basic"] is True
     assert verdicts["cut"]["deep"] is False
+
+
+def test_frames_check_is_a_strict_superset_of_deep(verdicts):
+    """
+    --touch-frames must catch everything --deep-check-bbb catches, and more.
+
+    The reason this check exists is field-level corruption that only surfaces on
+    attribute access, which deep provably misses. But it must not trade that for
+    losing truncation detection -- an operator who passes only --touch-frames would
+    otherwise get weaker coverage than before.
+    """
+    for name in ("v1", "v3", "cut", "hdr", "zero"):
+        deep = verdicts[name]["deep"]
+        frames = verdicts[name]["frames"]
+        assert frames != "inconclusive", (
+            f"{name}: the check could not reach a detection field, so it cannot judge "
+            f"this file -- callers quarantine what it calls invalid")
+        if deep is False:
+            assert frames is False, f"{name}: deep rejects it but frames accepts it"
+
+
+def test_frames_check_accepts_valid_files(verdicts):
+    assert verdicts["v1"]["frames"] is True
+    assert verdicts["v3"]["frames"] is True
 
 
 @pytest.mark.parametrize("workers", [1, 4])

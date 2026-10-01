@@ -743,17 +743,29 @@ def _run_isolated_capnp_check(script: str, timeout: int = 60) -> bool:
     multiprocessing: a pool worker that aborts mid-task never returns its result,
     and the parent then waits for it forever.
     """
+    return _run_isolated_capnp_check_rc(script, timeout) == 0
+
+
+def _run_isolated_capnp_check_rc(script: str, timeout: int = 60) -> int:
+    """
+    As _run_isolated_capnp_check, but returns the child's exit code.
+
+    Callers that distinguish "corrupt" from "could not check" need the code, not a
+    bool: collapsing the two makes an unreadable file and an unrecognised schema look
+    identical, and a tool that MOVES files on "invalid" must never do that because it
+    failed to understand the schema. -1 stands for never-ran / timed out.
+    """
     try:
         result = subprocess.run(
             [sys.executable, "-c", script],
             timeout=timeout,
             capture_output=True,
         )
-        return result.returncode == 0
+        return result.returncode
     except subprocess.TimeoutExpired:
-        return False
+        return -1
     except Exception:
-        return False
+        return -1
 
 
 def is_bbb_file_valid_basicmatch(bbb_file, check_read_file = False):
@@ -862,6 +874,111 @@ except Exception:
     sys.exit(1)  # invalid
 '''
     return _run_isolated_capnp_check(script)
+
+
+class BbbCheckInconclusive(RuntimeError):
+    """Raised when a .bbb could not be checked, as opposed to found corrupt."""
+
+
+def is_bbb_file_valid_frames(bbb_file, timeout: int = 300):
+    """
+    Validity check that touches every frame's detection fields.
+
+    This exists because is_bbb_file_valid_deep cannot see the corruption that actually
+    breaks the pipeline. capnp is lazy: a file whose framing is intact but whose
+    detection pointer is damaged parses fine under FrameContainer.read() and only blows
+    up when something reads the field --
+
+        KjException: capnp/layout.c++: expected ref->kind() == WirePointer::LIST [0 == 1];
+        Schema mismatch: Message contains non-list pointer where list pointer was expected
+
+    which is how two hours of 2026 data killed save_detect and tracking repeatedly while
+    the deep check called them clean. The exception fires on attribute ACCESS (pycapnp
+    _DynamicStructReader.__getattr__), so touching the field is enough; nothing needs to
+    be iterated or materialised.
+
+    The fields touched mirror bb_tracking.data_walker.iterate_bb_binary_repository
+    (detectionsDP or detectionsUnion.detectionsDP, and detectionsBees), so this fails
+    exactly where the pipeline fails rather than on a traversal of our own invention.
+
+    Raises BbbCheckInconclusive if no known detection field could be reached on any
+    frame -- an unrecognised schema must not be reported as corruption, because callers
+    quarantine what this calls invalid.
+    """
+    if not os.path.exists(bbb_file):
+        return False
+    try:
+        if os.path.getsize(bbb_file) == 0:
+            return False
+    except Exception:
+        pass
+
+    # Exit codes: 0 valid, 1 corrupt, 3 no detection field found (schema unknown).
+    script = f'''
+import sys
+import bb_binary
+bbb = bb_binary.common.bbb
+
+import os
+bbb_file = {bbb_file!r}
+try:
+    size = os.path.getsize(bbb_file)
+except Exception:
+    size = None
+
+touched = 0
+try:
+    with open(bbb_file, "rb") as f:
+        while True:
+            pos = f.tell()
+            if size is not None:
+                if pos == size:
+                    break          # clean end of stream
+                if size - pos < 8:
+                    sys.exit(1)    # trailing garbage, too short for a header
+            try:
+                fc = bbb.FrameContainer.read(f)
+            except Exception:
+                # Same rule as is_bbb_file_valid_deep: being at EOF BEFORE the read is
+                # the only clean end. A read that blew up mid-stream is truncation, so
+                # this check stays a strict superset of the deep one.
+                if size is not None and pos >= size:
+                    break
+                sys.exit(1)
+            if f.tell() <= pos:
+                sys.exit(1)
+            for frame in fc.frames:
+                # Tagged detections: 2019-style flat field, else under the union.
+                try:
+                    d = frame.detectionsDP
+                    touched += 1
+                except AttributeError:
+                    try:
+                        d = frame.detectionsUnion.detectionsDP
+                        touched += 1
+                    except AttributeError:
+                        pass
+                # Untagged detections: data_walker reads this unconditionally.
+                try:
+                    b = frame.detectionsBees
+                    touched += 1
+                except AttributeError:
+                    pass
+except Exception:
+    sys.exit(1)
+
+sys.exit(0 if touched else 3)
+'''
+    rc = _run_isolated_capnp_check_rc(script, timeout)
+    if rc == 0:
+        return True
+    if rc == 3:
+        raise BbbCheckInconclusive(
+            f"no detectionsDP/detectionsBees field could be read in {bbb_file}; "
+            f"the schema is not one this check understands, so it cannot say whether "
+            f"the file is corrupt"
+        )
+    return False
 
 
 def is_dill_file_valid(dill_file):
