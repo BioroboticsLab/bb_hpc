@@ -139,6 +139,7 @@ RUN . /opt/conda/etc/profile.d/conda.sh && \
     conda activate beesbook && \
     conda install -n beesbook -c conda-forge cairo freetype -y && \
     conda install -n beesbook -c conda-forge pyarrow fastparquet -y && \
+    conda install -n beesbook -c conda-forge h5py "pytz>=2024.2" -y && \
     conda clean --all -y
 
 ###############################################################################

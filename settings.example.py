@@ -27,6 +27,8 @@ pi_videodir_hpc   = '/path/to/your/pi_videos/'
 # cell-seg heavy-preprocessing outputs
 frames_dir_hpc      = '/path/to/your/results/data_extracted_frames/'
 backgrounds_dir_hpc = '/path/to/your/results/data_backgrounds/'
+# bb_metrics git checkout visible to the pods (metrics jobs import it from here)
+bb_metrics_dir_hpc  = '/path/to/your/bb_metrics/'
 
 ## detect
 detect_settings = {
@@ -70,6 +72,15 @@ save_detect_settings = {
         "max_memory": "8GB",
         # can override others too, e.g. n_cpus/qos/exports
     },
+}
+
+## metrics (bb_metrics per hive-hour pair; K8s only). The run directory, pairs and all
+## parameters come from bb_metrics (metrics_pipeline.submit_metrics_cluster).
+metrics_settings = {
+    "jobname": "metrics",
+    "chunk_size": 20,        # hive-hour pairs per completion index (pod)
+    "workers_per_pod": 4,    # one single-threaded python per worker; size resources_metrics to match
+    "parallelism": 16,       # pods at once; metrics are I/O-bound and CPU-only, so above k8s.job.parallelism
 }
 
 ## tracking
@@ -217,6 +228,12 @@ k8s = {
         "requests": {"cpu": "4",  "memory": "8Gi"},
         "limits":   {"cpu": "8",  "memory": "16Gi"},
     },    
+
+    # CPU-only resources for metrics (per pod; workers_per_pod pairs in memory at once)
+    "resources_metrics": {
+        "requests": {"cpu": "4",  "memory": "12Gi"},
+        "limits":   {"cpu": "6",  "memory": "24Gi"},
+    },
 
     "env": {
         "WORKERS_PER_GPU": "4",

@@ -141,6 +141,9 @@ python -m bb_hpc.running_k8s.save_detect_submit --dates 20251001
 python -m bb_hpc.running_k8s.tracking_submit --dates 20251001
 # RPi-Detect (GPU support)
 python -m bb_hpc.running_k8s.detect_rpi_submit --dates 20251001
+# bb_metrics 1min/5min/60min metrics (CPU only). Usually called from the metrics notebook via
+# bb_metrics.metrics_pipeline.submit_metrics_cluster, which writes the run dir first.
+python -m bb_hpc.running_k8s.metrics_submit --run-dir <metrics_dir>/_cluster/<td>-<stamp> [--dry-run]
 ```
 
 ### Docker (local)
