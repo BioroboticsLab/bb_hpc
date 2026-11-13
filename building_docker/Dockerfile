@@ -76,7 +76,12 @@ RUN . /opt/conda/etc/profile.d/conda.sh && \
 
 ENV SETUPTOOLS_USE_DISTUTILS=local
 
-RUN pip uninstall -y bb_binary bb_pipeline bb_tracking bb_behavior bb_utils 2>/dev/null || true && \
+# Cache bust: the pip line below never changes, so without this Docker reuses the cached
+# layer and keeps the old bb_* code. A new value re-fetches from GitHub and rebuilds every
+# later stage (--no-cache-filter step4 does not). Docker_build_steps.sh passes the time.
+ARG BB_CACHEBUST=unset
+RUN echo "bb_* cache bust: ${BB_CACHEBUST}" && \
+    pip uninstall -y bb_binary bb_pipeline bb_tracking bb_behavior bb_utils 2>/dev/null || true && \
     pip install --upgrade \
       "git+https://github.com/BioroboticsLab/bb_binary#egg=bb_binary" \
       "git+https://github.com/BioroboticsLab/bb_pipeline#egg=bb_pipeline" \

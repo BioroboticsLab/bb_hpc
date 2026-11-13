@@ -1,4 +1,9 @@
 #!/bin/bash
+set -e
+
+# New value each run, so step4 re-installs the bb_* repos from GitHub and every later
+# stage is rebuilt on top of it (see ARG BB_CACHEBUST in the Dockerfile).
+BB_CACHEBUST=$(date +%Y%m%d-%H%M%S)
 
 ## STEP 1
 docker buildx build \
@@ -25,6 +30,7 @@ docker buildx build \
 docker buildx build \
   --platform linux/amd64 \
   --target step4 \
+  --build-arg BB_CACHEBUST=$BB_CACHEBUST \
   -t jacobdavidson/beesbook-step4:latest \
   .
 
@@ -32,6 +38,7 @@ docker buildx build \
 docker buildx build \
   --platform linux/amd64 \
   --target step5 \
+  --build-arg BB_CACHEBUST=$BB_CACHEBUST \
   -t jacobdavidson/beesbook-step5:latest \
   .
 
@@ -39,12 +46,14 @@ docker buildx build \
 docker buildx build \
   --platform linux/amd64 \
   --target step6 \
+  --build-arg BB_CACHEBUST=$BB_CACHEBUST \
   -t jacobdavidson/beesbook-step6:latest \
   .
 
 ## FINAL IMAGE
 docker buildx build \
   --platform linux/amd64 \
+  --build-arg BB_CACHEBUST=$BB_CACHEBUST \
   -t jacobdavidson/beesbook:latest \
   .
 

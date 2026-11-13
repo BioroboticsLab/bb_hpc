@@ -3,7 +3,7 @@
 # - CUDA-ready NGC base (NGC PyTorch 24.08)
 # - Python 3.12 via conda-forge (Miniforge) in conda env "combbg"
 # - cell-seg heavy tools (frame_extractor + background_generator) installed from
-#   the bbhpc-integration branch (override with --build-arg CELLSEG_REPO_REF=...)
+#   the main branch (override with --build-arg CELLSEG_REPO_REF=...)
 # - Layout matches the docker/k8s runner bash: /opt/conda + `conda activate combbg`
 ###############################################################################
 FROM nvcr.io/nvidia/pytorch:24.08-py3 AS base
@@ -58,9 +58,9 @@ RUN set -euo pipefail && \
 # install.py background-generator installs honeybee_segmentor + frame_extractor +
 # background_generator (editable) from the heavy_preprocessing/ layout.
 # Branch matters: bb_hpc calls BackgroundImageGenerator(..., cams=[cam]), which only
-# exists on bbhpc-integration -- a `main` build is missing the cams= argument.
+# exists on main since the bbhpc-integration merge (2026-11); older commits lack the cams= argument.
 ARG CELLSEG_REPO_URL=https://github.com/BioroboticsLab/honeybee_cell_segmentation_pipeline.git
-ARG CELLSEG_REPO_REF=bbhpc-integration
+ARG CELLSEG_REPO_REF=main
 # PyTorch CUDA wheel channel. cu118 wheels include Pascal/Volta (sm_61/sm_70,
 # e.g. GTX 1080 Ti) up through Hopper (sm_90). The cu126 wheels DROP everything
 # below sm_75, so a 1080 Ti hits "no kernel image available". Use cu126 only for
@@ -88,11 +88,11 @@ RUN set -euo pipefail && \
     python -m pip install --no-cache-dir --upgrade "cupy-cuda12x>=13.4.1,<14.0.0"
 
 # Build-time sanity check: torch imports and the bb_hpc-facing API is present
-# (cams=/dates= prove we built the bbhpc-integration branch; window_tz proves it
+# (cams=/dates= prove we built a post-bbhpc-integration commit; window_tz proves it
 # is recent enough for local-time background windows). Written as a single
 # `python -c` line because the miniforge stage uses SHELL ["/bin/bash","-lc"],
 # under which a RUN heredoc is NOT fed to stdin (it silently becomes a no-op).
-RUN python -c "import inspect, torch; from background_generator.background_img_generator import BackgroundImageGenerator as B; sig = inspect.signature(B.__init__); print('Torch:', torch.__version__); print('BackgroundImageGenerator.__init__', sig); assert 'cams' in sig.parameters and 'dates' in sig.parameters, 'wrong branch: need bbhpc-integration (cams=/dates= missing)'; from background_generator.utils import BgImageGenConfig as C; assert 'window_tz' in C.model_fields, 'engine too old: BgImageGenConfig.window_tz missing'"
+RUN python -c "import inspect, torch; from background_generator.background_img_generator import BackgroundImageGenerator as B; sig = inspect.signature(B.__init__); print('Torch:', torch.__version__); print('BackgroundImageGenerator.__init__', sig); assert 'cams' in sig.parameters and 'dates' in sig.parameters, 'engine too old: need a commit from the merged bbhpc-integration work (cams=/dates= missing)'; from background_generator.utils import BgImageGenConfig as C; assert 'window_tz' in C.model_fields, 'engine too old: BgImageGenConfig.window_tz missing'"
 
 # The frame extractor finds ffmpeg on PATH automatically (determine_ffmpeg_bin_path).
 # NOTE: the apt ffmpeg may lack NVDEC (hevc_cuvid). For GPU decode supply a
