@@ -182,7 +182,7 @@ k8s = {
     "image_pull_secret": os.environ.get("K8S_IMAGE_PULL_SECRET", "your-image-pull-secret"),
     "image": os.environ.get("K8S_IMAGE", "your-registry.example.com/your-username/beesbook:latest"),
     # cell-seg heavy preprocessing (frame_extract / background) image: combbg env
-    # with frame_extractor + background_generator + cupy (bbhpc-integration branch).
+    # with frame_extractor + background_generator + cupy (cell-seg main branch).
     "image_comb": os.environ.get("K8S_IMAGE_COMB", "your-registry.example.com/your-username/comb-background:latest"),
     "comb_conda_env": "combbg",
 

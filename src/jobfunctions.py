@@ -1209,7 +1209,7 @@ def job_for_background_chunk(work_units):
             if "window_tz" in cfg_kwargs and "window_tz" not in known:
                 raise RuntimeError(
                     "window_tz is set but this background_generator build does not support it; "
-                    "rebuild the comb-background image from the bbhpc-integration branch")
+                    "rebuild the comb-background image from the cell-seg main branch")
             config = BgImageGenConfig(**cfg_kwargs)
 
             gen_kwargs = dict(
